@@ -1,0 +1,9 @@
+﻿condition_id,N,shift,impact,tree,dif_node,K,dif_items,status
+C029,1000,0.0,0.0,MDE,none,10,1;2;3;4,planned
+C030,1000,0.0,0.0,EMD,none,10,1;2;3;4,planned
+C031,1000,0.0,0.5,MDE,none,10,1;2;3;4,planned
+C032,1000,0.0,0.5,EMD,none,10,1;2;3;4,planned
+C047,1000,0.6,0.0,MDE,extreme,10,1;2;3;4,planned
+C050,1000,0.6,0.0,EMD,extreme,10,1;2;3;4,planned
+C053,1000,0.6,0.5,MDE,extreme,10,1;2;3;4,planned
+C056,1000,0.6,0.5,EMD,extreme,10,1;2;3;4,planned
