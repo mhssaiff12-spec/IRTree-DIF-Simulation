@@ -1,0 +1,90 @@
+name: IRTree main-seed resume test (one replication)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: irtree-resume-smoke
+  cancel-in-progress: false
+jobs:
+  produce:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+          use-public-rspm: false
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+      - name: Install frozen R packages
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Produce C029 replication 11 (new main seed)
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: C029
+          IRTREE_REP_FROM: "11"
+          IRTREE_REP_TO: "11"
+          IRTREE_SEED_SCHEME: main
+          IRTREE_ORACLE_DRAWS: "1"
+          IRTREE_OUT: persistence_trial
+          IRTREE_REQUIRE_FROZEN: "1"
+        run: |
+          Rscript main_sim.R
+          test -s persistence_trial/C029/rep_0011.rds
+          sha256sum persistence_trial/C029/rep_0011.rds > persistence_trial/checksum.sha256
+          Rscript -e 'x<-readRDS("persistence_trial/C029/rep_0011.rds"); stopifnot(!is.null(x$meta), x$meta$rep == 11); cat("MAIN_SEED_REP_PASS\n")'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: irtree-main-seed-resume-test
+          path: sim/persistence_trial/
+          if-no-files-found: error
+          retention-days: 14
+  restore_and_skip:
+    needs: produce
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: irtree-main-seed-resume-test
+          path: sim/persistence_trial/
+      - name: Check restored result is intact
+        working-directory: sim
+        run: |
+          test -s persistence_trial/C029/rep_0011.rds
+          sha256sum -c persistence_trial/checksum.sha256
+          echo "RESTORE_PASS"
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+          use-public-rspm: false
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+      - name: Install frozen R packages
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Resume with same task; must skip and preserve file
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: C029
+          IRTREE_REP_FROM: "11"
+          IRTREE_REP_TO: "11"
+          IRTREE_SEED_SCHEME: main
+          IRTREE_ORACLE_DRAWS: "1"
+          IRTREE_OUT: persistence_trial
+          IRTREE_REQUIRE_FROZEN: "1"
+        run: |
+          BEFORE=$(sha256sum persistence_trial/C029/rep_0011.rds | cut -d' ' -f1)
+          Rscript main_sim.R
+          AFTER=$(sha256sum persistence_trial/C029/rep_0011.rds | cut -d' ' -f1)
+          test "$BEFORE" = "$AFTER"
+          test "$(find persistence_trial -name 'rep_*.rds' | wc -l)" -eq 1
+          echo "RESUME_SKIP_PASS"
