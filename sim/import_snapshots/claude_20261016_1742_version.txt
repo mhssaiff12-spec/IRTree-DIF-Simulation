@@ -1,0 +1,5 @@
+snapshot: 2026-10-16 17:42:03 +03
+manifest_id (MD5 prefix of FROZEN_MANIFEST.csv): ab03dffdf580
+manifest file md5: ab03dffdf5801369585d2d6adb1a5a74
+seed scheme: main; data seed = 100000000 + cell*100000 + rep; oracle seed = data seed + 10001
+Algorithms and seeds unchanged; running jobs were not stopped.
