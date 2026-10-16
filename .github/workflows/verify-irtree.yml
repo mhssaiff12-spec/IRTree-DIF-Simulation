@@ -1,0 +1,49 @@
+name: IRTree verification (manual only)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check portable source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in sim/main_sim.R sim/verify_install.R sim/FROZEN_MANIFEST.csv R_env/install_pinned.R R_env/R_packages_pinned.csv; do
+            test -f "$f" || { echo "::error::Missing $f. Upload the extracted portable package before running."; exit 1; }
+          done
+          test -d R_env/vendor || { echo "::error::Missing R_env/vendor. Upload the dependency sources."; exit 1; }
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+          use-public-rspm: false
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+      - name: Install pinned packages
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Verify frozen reference
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+        run: |
+          IRTREE_COND=C047 IRTREE_REP_FROM=1 IRTREE_REP_TO=1 IRTREE_SEED_SCHEME=legacy IRTREE_ORACLE_DRAWS=3 IRTREE_OUT=check Rscript main_sim.R
+          Rscript verify_install.R | tee verify_log.txt
+          grep -q PASS verify_log.txt
+      - name: Save logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: irtree-verification-log
+          path: |
+            sim/verify_log.txt
+            sim/check
+          if-no-files-found: ignore
+          retention-days: 14
