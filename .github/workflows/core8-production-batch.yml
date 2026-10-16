@@ -1,0 +1,164 @@
+name: IRTree core8 controlled production batches
+on:
+  workflow_dispatch:
+    inputs:
+      from_rep:
+        description: "First replication (default 192)"
+        required: true
+        default: "192"
+        type: string
+      to_rep:
+        description: "Last replication (default 195)"
+        required: true
+        default: "195"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: irtree-results-writer
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate range and results branch
+        env:
+          FROM: ${{ inputs.from_rep }}
+          TO: ${{ inputs.to_rep }}
+        run: |
+          set -euo pipefail
+          [[ "$FROM" =~ ^[0-9]+$ && "$TO" =~ ^[0-9]+$ ]] || exit 1
+          (( FROM >= 1 && FROM <= TO && TO <= 200 )) || { echo "::error::Range must lie in 1..200"; exit 1; }
+          (( TO - FROM + 1 <= 8 )) || { echo "::error::Batch permits at most 8 replications per condition"; exit 1; }
+          git fetch origin results
+          git ls-tree -r --name-only origin/results sim/results_core8 | grep -q 'rep_0001.rds'
+          echo "CORE8_GUARD_PASS"
+
+  compute:
+    needs: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        condition: [C029, C030, C031, C032, C047, C050, C053, C056]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Retrieve completed replications for this condition
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p "sim/results_core8/$COND"
+          git archive --format=tar origin/results "sim/results_core8/$COND" | tar -xf -
+          echo "Imported existing $COND replications before any calculation"
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+          use-public-rspm: false
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+      - name: Install pinned R packages
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Run only missing batch replications
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          IRTREE_REP_FROM: ${{ inputs.from_rep }}
+          IRTREE_REP_TO: ${{ inputs.to_rep }}
+          IRTREE_SEED_SCHEME: main
+          IRTREE_ORACLE_DRAWS: "1"
+          IRTREE_REQUIRE_FROZEN: "1"
+          IRTREE_OUT: results_core8
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          Rscript main_sim.R
+          COND="$IRTREE_COND" FROM="$IRTREE_REP_FROM" TO="$IRTREE_REP_TO" Rscript - <<'RS'
+          cnd <- Sys.getenv("COND"); fr <- as.integer(Sys.getenv("FROM")); to <- as.integer(Sys.getenv("TO"))
+          for (r in fr:to) {
+            f <- sprintf("results_core8/%s/rep_%04d.rds", cnd, r)
+            stopifnot(file.exists(f))
+            x <- readRDS(f)
+            stopifnot(nrow(x$meta) == 1, x$meta$rep[1] == r, x$meta$condition_id[1] == cnd,
+                      identical(x$meta$manifest_id[1], "ab03dffdf580"),
+                      !is.null(x$results), nrow(x$results) >= 4, all(x$results$status != "ERROR"))
+          }
+          cat("CORE8_REPLICATIONS_PASS\n")
+          RS
+      - name: Package only this batch for merging
+        working-directory: sim
+        env:
+          COND: ${{ matrix.condition }}
+          FROM: ${{ inputs.from_rep }}
+          TO: ${{ inputs.to_rep }}
+        run: |
+          set -euo pipefail
+          mkdir -p "batch_upload/$COND"
+          for (( r=10#$FROM; r<=10#$TO; r++ )); do
+            cp "results_core8/$COND/$(printf 'rep_%04d.rds' "$r")" "batch_upload/$COND/"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core8-batch-${{ matrix.condition }}
+          path: sim/batch_upload/
+          if-no-files-found: error
+          retention-days: 14
+
+  merge:
+    needs: compute
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core8-batch-*
+          path: incoming/
+          merge-multiple: true
+      - name: Merge without overwrites and preserve existing files
+        env:
+          FROM: ${{ inputs.from_rep }}
+          TO: ${{ inputs.to_rep }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin results
+          git switch -C results origin/results
+          count=0
+          for cnd in C029 C030 C031 C032 C047 C050 C053 C056; do
+            for (( r=10#$FROM; r<=10#$TO; r++ )); do
+              fn="$(printf 'rep_%04d.rds' "$r")"
+              src="incoming/$cnd/$fn"
+              dst="sim/results_core8/$cnd/$fn"
+              test -s "$src"
+              if [[ -e "$dst" ]]; then
+                cmp -s "$src" "$dst" || { echo "::error::Conflicting result $dst; refusing overwrite"; exit 1; }
+              else
+                mkdir -p "$(dirname "$dst")"
+                cp "$src" "$dst"
+                count=$((count+1))
+              fi
+            done
+          done
+          git add -f sim/results_core8
+          if ! git diff --cached --quiet; then
+            git commit -m "Core8 production batch merged replications $FROM-$TO"
+            git push origin results
+          fi
+          echo "CORE8_BATCH_MERGE_PASS: $count new replication files"
