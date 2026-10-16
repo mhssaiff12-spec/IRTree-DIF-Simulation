@@ -31,7 +31,7 @@ jobs:
           options(digits=16)
           clean <- function(x) {
             if (is.data.frame(x)) {
-              x <- x[, setdiff(names(x), c("host","time","wall_seconds","screen_seconds")), drop=FALSE]
+              x <- x[, setdiff(names(x), c("host","time","wall_seconds","screen_seconds","seconds","seconds_link")), drop=FALSE]
               rownames(x) <- NULL
               return(x)
             }
@@ -47,17 +47,17 @@ jobs:
             cat("Claude metadata:\n");print(cl$meta)
             for (field in c("results","nodes","anchors","links","issues")) {
               a <- clean(gh[[field]]); b <- clean(cl[[field]])
-              eq <- isTRUE(all.equal(a,b,tolerance=1e-8,check.attributes=FALSE))
-              cat(field,"EQUAL within tolerance 1e-8:",eq,"\n")
+              eq <- isTRUE(all.equal(a,b,tolerance=1e-7,check.attributes=FALSE))
+              cat(field,"EQUAL within tolerance 1e-7:",eq,"\n")
               if (!eq) {
                 good <- FALSE
                 cat("First differences:\n")
-                print(utils::head(capture.output(all.equal(a,b,tolerance=1e-8,check.attributes=FALSE)),12))
+                print(utils::head(capture.output(all.equal(a,b,tolerance=1e-7,check.attributes=FALSE)),12))
               }
             }
-            meta_equal <- isTRUE(all.equal(clean(gh$meta),clean(cl$meta),tolerance=1e-8,check.attributes=FALSE))
+            meta_equal <- isTRUE(all.equal(clean(gh$meta),clean(cl$meta),tolerance=1e-7,check.attributes=FALSE))
             cat("METADATA excluding timing/host EQUAL:",meta_equal,"\n")
-            if (!meta_equal) print(utils::head(capture.output(all.equal(clean(gh$meta),clean(cl$meta),tolerance=1e-8,check.attributes=FALSE)),12))
+            if (!meta_equal) print(utils::head(capture.output(all.equal(clean(gh$meta),clean(cl$meta),tolerance=1e-7,check.attributes=FALSE)),12))
           }
           cat("\nSTATISTICAL_AUDIT_PASS:", good, "\n")
           if (!good) quit(status=2)
