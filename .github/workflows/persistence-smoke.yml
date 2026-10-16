@@ -1,0 +1,44 @@
+name: IRTree result persistence smoke test
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  save:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve a genuine RDS as test payload
+        run: |
+          set -euo pipefail
+          test -s sim/reference_C047_legacy_rep1.rds
+          mkdir -p transfer
+          cp sim/reference_C047_legacy_rep1.rds transfer/reference.rds
+          sha256sum transfer/reference.rds | awk '{print $1}' > transfer/reference.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: irtree-persistence-test
+          path: transfer/
+          retention-days: 7
+          if-no-files-found: error
+  restore:
+    needs: save
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: irtree-persistence-test
+          path: restored/
+      - name: Verify restored bytes in a NEW job
+        run: |
+          set -euo pipefail
+          test -s restored/reference.rds
+          actual="$(sha256sum restored/reference.rds | awk '{print $1}')"
+          expected="$(cat restored/reference.sha256)"
+          original="$(sha256sum sim/reference_C047_legacy_rep1.rds | awk '{print $1}')"
+          test "$actual" = "$expected"
+          test "$actual" = "$original"
+          echo "PERSISTENCE_PASS: artifact survived job boundary; checksum identical."
