@@ -83,7 +83,8 @@ jobs:
           mkdir -p sim/import_snapshots
           cp /tmp/irtree_snapshot/VERSION_ID.txt sim/import_snapshots/claude_20261016_1742_version.txt
           cp /tmp/irtree_snapshot/IMPORT_SOURCE.txt sim/import_snapshots/claude_20261016_1742.txt
-          git add -f sim/results_core8\n          git add sim/import_snapshots
+          git add -f sim/results_core8
+          git add sim/import_snapshots
           if ! git diff --cached --quiet; then
             git commit -m "Import verified Claude snapshot (36 core8 replications)"
             git push origin results
