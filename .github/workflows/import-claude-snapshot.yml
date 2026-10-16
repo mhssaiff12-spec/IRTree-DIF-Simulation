@@ -1,0 +1,91 @@
+name: Import Claude core8 snapshot (manual)
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: irtree-results-import
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate archive and prepare safe import
+        env:
+          ZIP: IRTree_core8_backup_20261016_1742.zip
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import zipfile,hashlib,os,pathlib,csv
+          zpath="IRTree_core8_backup_20261016_1742.zip"
+          if not os.path.isfile(zpath):
+              raise SystemExit("Upload the Claude backup ZIP at repository root first: "+zpath)
+          with zipfile.ZipFile(zpath) as z:
+              names=z.namelist()
+              prefix="backup_20261016_1742/"
+              assert all(n.startswith(prefix) for n in names), "Unexpected archive paths"
+              sums=z.read(prefix+"SHA256SUMS.txt").decode()
+              for line in sums.splitlines():
+                  if not line.strip(): continue
+                  checksum, filename=line.split(maxsplit=1)
+                  name=prefix+filename.lstrip("*./")
+                  assert name in names and hashlib.sha256(z.read(name)).hexdigest()==checksum, "SHA mismatch "+name
+              version=z.read(prefix+"VERSION_ID.txt").decode()
+              assert "ab03dffdf580" in version, "Wrong frozen simulation manifest"
+              progress=list(csv.DictReader(z.read(prefix+"PROGRESS_core8.csv").decode().splitlines()))
+              assert len(progress)==8
+              rds=[n for n in names if n.endswith(".rds")]
+              assert len(rds)==36, "Unexpected number of records"
+              for n in rds:
+                  rel=n[len(prefix+"results_core8/"):]
+                  parts=pathlib.PurePosixPath(rel).parts
+                  assert len(parts)==2 and parts[0] in ("C029","C030","C031","C032","C047","C050","C053","C056") and parts[1].startswith("rep_")
+              out=pathlib.Path("/tmp/irtree_snapshot")
+              out.mkdir(exist_ok=True)
+              for n in rds:
+                  target=out / n[len(prefix+"results_core8/"):]
+                  target.parent.mkdir(parents=True,exist_ok=True)
+                  target.write_bytes(z.read(n))
+              (out/"VERSION_ID.txt").write_text(version)
+              (out/"IMPORT_SOURCE.txt").write_text("Imported snapshot 2026-10-16 17:42 +03; 36 RDS files; SHA256 checks passed.\n")
+              print("SNAPSHOT_VALIDATED",len(rds))
+          PY
+      - name: Import only missing files into results branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin results || true
+          if git show-ref --verify --quiet refs/remotes/origin/results; then
+            git switch -C results origin/results
+          else
+            git switch -c results
+          fi
+          mkdir -p sim/results_core8
+          count=0
+          while IFS= read -r -d '' file; do
+            rel="${file#/tmp/irtree_snapshot/}"
+            dst="sim/results_core8/$rel"
+            if [ -e "$dst" ]; then
+              cmp -s "$file" "$dst" || { echo "::error::Conflicting existing result $dst"; exit 1; }
+            else
+              mkdir -p "$(dirname "$dst")"
+              cp "$file" "$dst"
+              count=$((count+1))
+            fi
+          done < <(find /tmp/irtree_snapshot -name 'rep_*.rds' -print0)
+          mkdir -p sim/import_snapshots
+          cp /tmp/irtree_snapshot/VERSION_ID.txt sim/import_snapshots/claude_20261016_1742_version.txt
+          cp /tmp/irtree_snapshot/IMPORT_SOURCE.txt sim/import_snapshots/claude_20261016_1742.txt
+          git add sim/results_core8 sim/import_snapshots
+          if ! git diff --cached --quiet; then
+            git commit -m "Import verified Claude snapshot (36 core8 replications)"
+            git push origin results
+          fi
+          echo "SNAPSHOT_IMPORT_PASS: $count new replication files. No overwrites."
