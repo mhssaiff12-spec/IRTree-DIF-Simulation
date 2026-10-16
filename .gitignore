@@ -1,0 +1,6 @@
+Rlib/
+.Rhistory
+.RData
+*.tmp_*
+sim/check/
+sim/results_core8/
