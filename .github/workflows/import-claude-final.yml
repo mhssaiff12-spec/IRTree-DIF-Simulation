@@ -1,0 +1,98 @@
+name: Import final Claude core8 backup (148 RDS)
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: irtree-results-writer
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate ZIP contents and RDS checksums
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import zipfile,hashlib,os,pathlib,csv,re
+          path="IRTree_core8_backup_final_20261017_0109.zip"
+          if not os.path.exists(path): raise SystemExit("Upload "+path+" to the main repository root first.")
+          prefix="backup_final_20261017_0109/"
+          out=pathlib.Path("/tmp/irtree_final_import")
+          out.mkdir(exist_ok=True)
+          with zipfile.ZipFile(path) as z:
+            assert z.testzip() is None,"Damaged ZIP member"
+            rds=[n for n in z.namelist() if n.endswith(".rds")]
+            assert len(rds)==148, f"Expected 148 RDS, found {len(rds)}"
+            expected={"C029":19,"C030":19,"C031":19,"C032":19,"C047":18,"C050":18,"C053":18,"C056":18}
+            sums={}
+            for line in z.read(prefix+"SHA256SUMS.txt").decode().splitlines():
+              if not line.strip():continue
+              sha,name=line.split(maxsplit=1)
+              sums[name.lstrip("*./")]=sha
+            counts={c:0 for c in expected}
+            for pathin in rds:
+              assert pathin.startswith(prefix+"results_core8/"),pathin
+              rel=pathin[len(prefix+"results_core8/"):]
+              bits=pathlib.PurePosixPath(rel).parts
+              assert len(bits)==2 and bits[0] in expected and re.fullmatch(r"rep_[0-9]{4}\.rds",bits[1]),rel
+              n=int(bits[1][4:8]); assert 1<=n<=expected[bits[0]],rel
+              counts[bits[0]]+=1
+              data=z.read(pathin)
+              assert hashlib.sha256(data).hexdigest()==sums["results_core8/"+rel], "Bad SHA256 "+rel
+              target=out/rel; target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+            assert counts==expected,(counts,expected)
+            version=z.read(prefix+"VERSION_ID.txt").decode()
+            assert "ab03dffdf580" in version
+            (out/"VERSION_ID.txt").write_text(version)
+            print("FINAL_SNAPSHOT_VERIFIED",sum(counts.values()),counts)
+          PY
+      - name: Merge only missing results, archive conflicts separately
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin results
+          git switch -C results origin/results
+          count=0; same=0; conflicts=0
+          mkdir -p /tmp/irtree_conflicts
+          while IFS= read -r -d '' file; do
+            rel="${file#/tmp/irtree_final_import/}"
+            dst="sim/results_core8/$rel"
+            if [[ -f "$dst" ]]; then
+              if cmp -s "$file" "$dst"; then
+                same=$((same+1))
+              else
+                mkdir -p "/tmp/irtree_conflicts/$(dirname "$rel")"
+                cp "$file" "/tmp/irtree_conflicts/$rel"
+                echo "OVERLAP_DIFFERENT_BYTES $rel (retaining existing GitHub result)" | tee -a /tmp/irtree_conflicts/conflict_log.txt
+                conflicts=$((conflicts+1))
+              fi
+            else
+              mkdir -p "$(dirname "$dst")"
+              cp "$file" "$dst"
+              count=$((count+1))
+            fi
+          done < <(find /tmp/irtree_final_import -name 'rep_*.rds' -print0)
+          mkdir -p sim/import_snapshots
+          cp /tmp/irtree_final_import/VERSION_ID.txt sim/import_snapshots/claude_final_20261017_0109_version.txt
+          printf "Imported final Claude snapshot 2026-10-17 01:09 +03; 148 SHA256-verified RDS; new=%s, byte-identical=%s, differing overlaps=%s; never overwritten existing results.\n" "$count" "$same" "$conflicts" > sim/import_snapshots/claude_final_20261017_0109.txt
+          git add -f sim/results_core8
+          git add sim/import_snapshots
+          if ! git diff --cached --quiet; then
+            git commit -m "Import missing results from final 148-RDS Claude snapshot"
+            git push origin results
+          fi
+          echo "FINAL_IMPORT_PASS new=$count identical=$same different_overlaps=$conflicts"
+      - name: Upload overlap audit if present
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-final-overlap-audit
+          path: /tmp/irtree_conflicts/
+          if-no-files-found: ignore
+          retention-days: 30
