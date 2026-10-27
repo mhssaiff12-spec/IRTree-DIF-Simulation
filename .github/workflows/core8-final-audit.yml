@@ -31,7 +31,7 @@ jobs:
           grid <- read_grid("conditions_56.csv")
           validate_grid(grid)
           expected_manifest <- "ab03dffdf580"
-          expected_methods <- c("OracleK","RankK","RankK2","BH")
+          expected_methods <- c("Oracle1","RankK","RankK2","BH")
           one <- function(cond, rep) {
             f <- sprintf("results_core8/%s/rep_%04d.rds",cond,rep)
             row <- grid[grid$condition_id==cond,,drop=FALSE]
