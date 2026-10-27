@@ -1,0 +1,172 @@
+name: IRTree Phase A automatic N1000 expansion
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */6 * * *"
+permissions:
+  contents: write
+concurrency:
+  group: irtree-results-writer
+  cancel-in-progress: false
+jobs:
+  compute:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 135
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        condition: [C033, C034, C035, C036, C037, C038, C039, C040, C041, C042, C043, C044, C045, C046, C048, C049, C051, C052, C054, C055]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restore completed expansion results and select missing tasks
+        id: plan
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p "sim/results_expansion56/$COND"
+          if git cat-file -e "origin/results:sim/results_expansion56/$COND" 2>/dev/null; then
+            git archive --format=tar origin/results "sim/results_expansion56/$COND" | tar -xf -
+          fi
+          python3 - <<'PY'
+          import os,pathlib
+          c=os.environ["COND"]; d=pathlib.Path("sim/results_expansion56")/c
+          missing=[i for i in range(1,201) if not (d/f"rep_{i:04d}.rds").exists()]
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f:
+            f.write(f"run={'true' if missing else 'false'}\n")
+            if missing:
+              # Strictly contiguous window; existing files inside window are skipped by R.
+              a=missing[0]; b=min(a+3,200)
+              f.write(f"first={a}\nlast={b}\n")
+              print(f"{c}: {200-len(missing)} existing, {len(missing)} missing; processing {a}-{b}")
+            else:print(f"{c}: all 200 present, no compute")
+          PY
+      - uses: r-lib/actions/setup-r@v2
+        if: steps.plan.outputs.run == 'true'
+        with:
+          r-version: "4.3.3"
+          use-public-rspm: false
+      - name: Install system dependencies
+        if: steps.plan.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+      - name: Install frozen R dependencies
+        if: steps.plan.outputs.run == 'true'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Calculate only missing replication files and verify contents
+        if: steps.plan.outputs.run == 'true'
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          IRTREE_REP_FROM: ${{ steps.plan.outputs.first }}
+          IRTREE_REP_TO: ${{ steps.plan.outputs.last }}
+          IRTREE_SEED_SCHEME: main
+          IRTREE_ORACLE_DRAWS: "1"
+          IRTREE_REQUIRE_FROZEN: "1"
+          IRTREE_OUT: results_expansion56
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          Rscript main_sim.R
+          Rscript - <<'RS'
+          source("sim_core.R")
+          cnd<-Sys.getenv("IRTREE_COND")
+          fr<-as.integer(Sys.getenv("IRTREE_REP_FROM"))
+          to<-as.integer(Sys.getenv("IRTREE_REP_TO"))
+          g<-read_grid("conditions_56.csv")
+          row<-g[g$condition_id==cnd,,drop=FALSE]
+          for(r in fr:to){
+            f<-sprintf("results_expansion56/%s/rep_%04d.rds",cnd,r)
+            stopifnot(file.exists(f))
+            x<-readRDS(f)
+            stopifnot(is.data.frame(x$meta),nrow(x$meta)==1,x$meta$rep[1]==r,
+              as.character(x$meta$condition_id[1])==cnd,
+              x$meta$seed[1]==data_seed(row,r,"main"),
+              identical(as.character(x$meta$manifest_id[1]),"ab03dffdf580"),
+              is.data.frame(x$results),nrow(x$results)==4,
+              setequal(as.character(x$results$method),c("Oracle1","RankK","RankK2","BH")),
+              !any(is.na(x$results$status)),all(x$results$status!="ERROR"))
+          }
+          cat("PHASE_A_REPLICATIONS_PASS",cnd,fr,to,"\n")
+          RS
+      - name: Stage this condition's checked replication files
+        if: steps.plan.outputs.run == 'true'
+        working-directory: sim
+        env:
+          COND: ${{ matrix.condition }}
+          FROM: ${{ steps.plan.outputs.first }}
+          TO: ${{ steps.plan.outputs.last }}
+        run: |
+          set -euo pipefail
+          mkdir -p "phasea_out/$COND"
+          for (( n=10#$FROM; n<=10#$TO; n++ )); do
+            cp "results_expansion56/$COND/$(printf 'rep_%04d.rds' "$n")" "phasea_out/$COND/"
+          done
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.run == 'true'
+        with:
+          name: phase-a-${{ matrix.condition }}
+          path: sim/phasea_out/
+          retention-days: 14
+          if-no-files-found: error
+  merge:
+    needs: compute
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phase-a-*
+          path: incoming/
+          merge-multiple: true
+        continue-on-error: true
+      - name: Merge without overwriting existing results; record progress
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin results
+          git switch -C results origin/results
+          count=0
+          if [ -d incoming ]; then
+            while IFS= read -r -d '' src; do
+              rel="${src#incoming/}"
+              dst="sim/results_expansion56/$rel"
+              if [ -f "$dst" ]; then
+                cmp -s "$src" "$dst" || { echo "::error::Collision at $rel; refusing overwrite"; exit 1; }
+              else
+                mkdir -p "$(dirname "$dst")"
+                cp "$src" "$dst"
+                count=$((count+1))
+              fi
+            done < <(find incoming -name 'rep_*.rds' -print0)
+          fi
+          git add -f sim/results_expansion56
+          if ! git diff --cached --quiet; then
+            git commit -m "Phase A N1000 expansion: $count new RDS"
+            git push origin results
+          fi
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import pathlib
+          cs="C033 C034 C035 C036 C037 C038 C039 C040 C041 C042 C043 C044 C045 C046 C048 C049 C051 C052 C054 C055".split()
+          total=0
+          print("## Phase A (20 new conditions at N=1000)")
+          print("| Condition | Files / 200 |")
+          print("|---|---:|")
+          for c in cs:
+            d=pathlib.Path("sim/results_expansion56")/c
+            n=sum((d/f"rep_{i:04d}.rds").exists() for i in range(1,201))
+            total+=n
+            print(f"| {c} | {n} |")
+          print(f"\n**Phase A: {total}/4000; remaining: {4000-total}.**")
+          if total==4000:print("\n**PHASE_A_FILES_COMPLETE — still requires final content audit.**")
+          PY
+          echo "PHASE_A_MERGE_PASS new=$count"
