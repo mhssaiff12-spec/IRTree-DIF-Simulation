@@ -1,0 +1,130 @@
+name: EXTRACT core8 final simulation results
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Read audited results branch
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          git archive --format=tar origin/results sim/results_core8 | tar -xf -
+          mkdir -p analysis_output
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+      - name: Aggregate all 1600 replications in R
+        working-directory: sim
+        run: |
+          Rscript - <<'RS'
+          dir.create("../analysis_output",showWarnings=FALSE)
+          conds <- c("C029","C030","C031","C032","C047","C050","C053","C056")
+          grid <- read.csv("conditions_56.csv",fileEncoding="UTF-8-BOM",stringsAsFactors=FALSE)
+          methods <- c("Oracle1","RankK","RankK2","BH")
+          allrows <- list(); alllinks <- list(); allmeta <- list(); allnodes <- list(); problems <- character()
+          count<-0L
+          for (cnd in conds) for(rep in 1:200) {
+            fn <- sprintf("results_core8/%s/rep_%04d.rds",cnd,rep)
+            if (!file.exists(fn)) stop("MISSING ",fn)
+            x<-readRDS(fn); count<-count+1L
+            if (nrow(x$results)!=4L || !setequal(as.character(x$results$method),methods))
+              stop("Unexpected methods: ",fn)
+            if (any(x$results$status=="ERROR"|is.na(x$results$status)))
+              stop("DIF method error in ",fn)
+            if (x$meta$rep[1]!=rep || as.character(x$meta$condition_id[1])!=cnd || 
+                as.character(x$meta$manifest_id[1])!="ab03dffdf580") stop("Metadata mismatch ",fn)
+            x$results$condition<-cnd; x$results$replication<-rep
+            x$links$condition<-cnd; x$links$replication<-rep
+            x$meta$condition<-cnd; x$meta$replication<-rep
+            x$nodes$condition<-cnd; x$nodes$replication<-rep
+            allrows[[count]]<-x$results
+            alllinks[[count]]<-x$links
+            allmeta[[count]]<-x$meta
+            allnodes[[count]]<-x$nodes
+          }
+          d<-do.call(rbind,allrows); l<-do.call(rbind,alllinks)
+          m<-do.call(rbind,allmeta); nd<-do.call(rbind,allnodes)
+          for (v in list(d,l,m,nd)) rownames(v)<-NULL
+          attr<-grid[match(d$condition,grid$condition_id),c("N","shift","impact","tree","dif_node"),drop=FALSE]
+          d<-cbind(d,attr)
+          write.csv(d,"../analysis_output/replication_method_metrics.csv",row.names=FALSE,na="")
+          write.csv(l,"../analysis_output/replication_link_diagnostics.csv",row.names=FALSE,na="")
+          write.csv(m,"../analysis_output/replication_metadata.csv",row.names=FALSE,na="")
+          write.csv(nd,"../analysis_output/node_level_results.csv",row.names=FALSE,na="")
+          metrics<-c("FPR","power","FDP","any_FP","TP","FP","FN","anchor_size",
+            "anchor_contaminated","anchor_precision","clean_items_removed",
+            "contaminated_items_excluded","node_power","FP_node_tests","flags_on_dif_items_wrong_node")
+          metrics<-intersect(metrics,names(d))
+          groups<-split(seq_len(nrow(d)),interaction(d$condition,d$method,drop=TRUE))
+          summaries<-lapply(groups,function(ids) {
+            a<-d[ids,,drop=FALSE]; row<-a[1,c("condition","method","N","shift","impact","tree","dif_node")]
+            row$n_rep<-nrow(a)
+            for(q in metrics){
+              z<-suppressWarnings(as.numeric(a[[q]])); z<-z[is.finite(z)]
+              row[[paste0(q,"_mean")]]<-if(length(z)) mean(z) else NA_real_
+              row[[paste0(q,"_mcse")]]<-if(length(z)>1) sd(z)/sqrt(length(z)) else NA_real_
+              row[[paste0(q,"_n")]]<-length(z)
+            }
+            row
+          })
+          sm<-do.call(rbind,summaries);rownames(sm)<-NULL
+          sm<-sm[order(sm$condition,match(sm$method,methods)),]
+          write.csv(sm,"../analysis_output/summary_condition_method.csv",row.names=FALSE,na="")
+          lg<-aggregate(rep(1,nrow(l)),l[,c("condition","method","node","link_status")],length)
+          names(lg)[ncol(lg)]<-"count"
+          write.csv(lg,"../analysis_output/link_status_counts.csv",row.names=FALSE,na="")
+          pairs<-list(C029="C030",C031="C032",C047="C050",C053="C056")
+          paired<-list(); j<-0L
+          for(a in names(pairs)){
+            b<-pairs[[a]]
+            da<-d[d$condition==a,]; db<-d[d$condition==b,]
+            shared<-intersect(metrics,c("FPR","power","FDP","any_FP","anchor_contaminated",
+              "anchor_precision","node_power","FP_node_tests"))
+            joined<-merge(da[,c("method","replication",shared)],
+              db[,c("method","replication",shared)],by=c("method","replication"),suffixes=c("_MDE","_EMD"))
+            for(mt in methods)for(metric in shared){
+              z<-joined[joined$method==mt,paste0(metric,"_EMD")]-joined[joined$method==mt,paste0(metric,"_MDE")]
+              z<-z[is.finite(z)];j<-j+1L
+              paired[[j]]<-data.frame(condition_MDE=a,condition_EMD=b,method=mt,
+                metric=metric,n=length(z),mean_EMD_minus_MDE=if(length(z))mean(z)else NA_real_,
+                mcse=if(length(z)>1)sd(z)/sqrt(length(z))else NA_real_)
+            }
+          }
+          pr<-do.call(rbind,paired)
+          write.csv(pr,"../analysis_output/paired_EMD_minus_MDE.csv",row.names=FALSE,na="")
+          tab<-sm[,intersect(c("condition","tree","shift","impact","method","n_rep",
+            "FPR_mean","FPR_mcse","power_mean","power_mcse","FDP_mean","FDP_mcse",
+            "any_FP_mean","anchor_contaminated_mean","anchor_precision_mean"),names(sm))]
+          write.csv(tab,"../analysis_output/manuscript_table_core8.csv",row.names=FALSE,na="")
+          cat("# IRTree core8 results – verified extraction\n\n",
+            "Replications: ",count," / 1600; method-level observations: ",nrow(d),".\n\n",
+            "Method labels: Oracle1 (one oracle reference draw), RankK, RankK2, BH.\n\n",
+            "FPR is averaged per replication; FDP is averaged per replication (Monte Carlo FDR); ",
+            "any_FP is family-wise false positive event rate. MCSE = SD/sqrt(valid replications). ",
+            "Power is undefined in null-DIF cells (shift=0), and is not converted to zero.\n\n",
+            "For the paired comparison, differences are EMD minus MDE for the same replication and method.\n\n",
+            "Output includes all method metrics, pairing contrasts, node results and linking status tables.\n",
+            file="../analysis_output/README.md",sep="")
+          cat("## EXTRACTED: ",count,"/1600 replication files; ",nrow(d)," method observations\n\n",sep="")
+          print(tab,row.names=FALSE)
+          RS
+      - name: Show extraction summary
+        if: success()
+        run: |
+          cat analysis_output/README.md >> "$GITHUB_STEP_SUMMARY"
+          echo '### Download extraction artifact for analysis' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Artifact: core8-extracted-statistical-results' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core8-extracted-statistical-results
+          path: analysis_output/
+          if-no-files-found: error
+          retention-days: 30
