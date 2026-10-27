@@ -1,0 +1,105 @@
+name: FINAL AUDIT core8 1600 RDS (read-only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download results branch without changing it
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p audit_output
+          git archive --format=tar origin/results sim/results_core8 | tar -xf -
+          echo "RESULTS_RETRIEVED"
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+      - name: Inspect every replication in R, including content and paired seeds
+        working-directory: sim
+        run: |
+          Rscript - <<'RS'
+          source("sim_core.R")
+          dir.create("../audit_output", showWarnings=FALSE)
+          conditions <- c("C029","C030","C031","C032","C047","C050","C053","C056")
+          grid <- read_grid("conditions_56.csv")
+          validate_grid(grid)
+          expected_manifest <- "ab03dffdf580"
+          expected_methods <- c("OracleK","RankK","RankK2","BH")
+          one <- function(cond, rep) {
+            f <- sprintf("results_core8/%s/rep_%04d.rds",cond,rep)
+            row <- grid[grid$condition_id==cond,,drop=FALSE]
+            problems <- character()
+            if (!file.exists(f)) return(data.frame(condition=cond,rep=rep,exists=FALSE,valid=FALSE,
+              methods=NA_character_,dif_errors=NA_integer_,link_failures=NA_integer_,reason="MISSING"))
+            x <- tryCatch(readRDS(f),error=function(e)e)
+            if (inherits(x,"error")) return(data.frame(condition=cond,rep=rep,exists=TRUE,valid=FALSE,
+              methods=NA_character_,dif_errors=NA_integer_,link_failures=NA_integer_,reason=paste("RDS_READ:",conditionMessage(x))))
+            if (!is.list(x) || !is.data.frame(x$meta) || nrow(x$meta)!=1) problems <- c(problems,"BAD_META")
+            if (is.data.frame(x$meta) && nrow(x$meta)==1) {
+              m <- x$meta
+              if (!identical(as.character(m$condition_id[1]),cond)) problems <- c(problems,"CONDITION_MISMATCH")
+              if (is.na(m$rep[1]) || m$rep[1]!=rep) problems <- c(problems,"REP_MISMATCH")
+              if (!("manifest_id" %in% names(m)) || !identical(as.character(m$manifest_id[1]),expected_manifest)) problems <- c(problems,"MANIFEST_MISMATCH")
+              if (!("seed" %in% names(m)) || is.na(m$seed[1]) || m$seed[1]!=data_seed(row,rep,"main")) problems <- c(problems,"SEED_MISMATCH")
+              if (!("tree" %in% names(m)) || as.character(m$tree[1])!=row$tree[1]) problems <- c(problems,"TREE_MISMATCH")
+              if ("fatal_error" %in% names(m) && any(!is.na(m$fatal_error) & nzchar(as.character(m$fatal_error)))) problems <- c(problems,"FATAL_ERROR")
+            }
+            z <- x$results
+            if (!is.data.frame(z) || !nrow(z)) {
+              problems <- c(problems,"MISSING_RESULTS")
+              methods <- NA_character_; ne <- NA_integer_
+            } else {
+              possible <- intersect(c("method","strategy","approach"),names(z))
+              methods <- if (length(possible)) paste(sort(unique(as.character(z[[possible[1]]]))),collapse=",") else NA_character_
+              if (!length(possible)) problems <- c(problems,"METHOD_COLUMN_UNKNOWN")
+              else if (!all(expected_methods %in% unique(as.character(z[[possible[1]]])))) problems <- c(problems,"METHOD_MISSING")
+              if (!("status" %in% names(z))) { problems <- c(problems,"RESULT_STATUS_MISSING"); ne <- NA_integer_ }
+              else { ne <- sum(is.na(z$status)|as.character(z$status)=="ERROR"); if (ne>0) problems <- c(problems,"DIF_ERROR") }
+            }
+            lk <- x$links
+            nl <- if (!is.data.frame(lk) || !("link_status" %in% names(lk))) NA_integer_ else sum(is.na(lk$link_status)|lk$link_status!="OK")
+            if (is.na(nl)) problems <- c(problems,"LINK_STATUS_UNKNOWN")
+            data.frame(condition=cond,rep=rep,exists=TRUE,valid=length(problems)==0,
+              methods=methods,dif_errors=ne,link_failures=nl,reason=paste(problems,collapse=";"))
+          }
+          records <- do.call(rbind,lapply(conditions,function(cnd)do.call(rbind,lapply(1:200,function(r)one(cnd,r)))))
+          write.csv(records,"../audit_output/replication_audit.csv",row.names=FALSE,na="")
+          summary <- do.call(rbind,lapply(conditions,function(cnd) {
+            t <- records[records$condition==cnd,]
+            data.frame(condition=cnd,existing=sum(t$exists),missing=sum(!t$exists),
+               structurally_valid=sum(t$valid),invalid=sum(t$exists & !t$valid),
+               dif_errors=sum(t$dif_errors,na.rm=TRUE),link_failures=sum(t$link_failures,na.rm=TRUE))
+          }))
+          write.csv(summary,"../audit_output/condition_summary.csv",row.names=FALSE)
+          cat("## Core8 final integrity audit\n\n",file="../audit_output/REPORT.md")
+          write.table(summary,"../audit_output/REPORT.md",append=TRUE,row.names=FALSE)
+          cat(sprintf("\nTotal files: %d / 1600; missing: %d; invalid: %d; DIF errors: %d; linking status issues: %d\n",
+            sum(summary$existing),sum(summary$missing),sum(summary$invalid),sum(summary$dif_errors),sum(summary$link_failures)),
+            file="../audit_output/REPORT.md",append=TRUE)
+          if (sum(summary$missing)>0 || sum(summary$invalid)>0) {
+            cat("\nAUDIT_FAIL: missing or structurally invalid RDS; see replication_audit.csv\n",
+                file="../audit_output/REPORT.md",append=TRUE)
+            print(summary);quit(status=2)
+          }
+          cat("\nAUDIT_PASS: 1600 readable RDS; metadata, fixed seeds, manifest, DIF methods and statuses validated.\n",
+              file="../audit_output/REPORT.md",append=TRUE)
+          print(summary)
+          RS
+      - name: Publish report in GitHub run summary
+        if: always()
+        run: |
+          if [ -f audit_output/REPORT.md ]; then cat audit_output/REPORT.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core8-final-audit-reports
+          path: audit_output/
+          if-no-files-found: warn
+          retention-days: 30
