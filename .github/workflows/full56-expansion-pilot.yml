@@ -1,0 +1,120 @@
+name: IRTree full56 expansion paired pilot (manual)
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: irtree-results-writer
+  cancel-in-progress: false
+jobs:
+  compute:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        condition: [C033, C036, C045, C048]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Load prior expansion results, if any
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p "sim/results_expansion56/$COND"
+          if git cat-file -e "origin/results:sim/results_expansion56/$COND" 2>/dev/null; then
+            git archive --format=tar origin/results "sim/results_expansion56/$COND" | tar -xf -
+          fi
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+          use-public-rspm: false
+      - name: Install OS libraries and frozen R packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Generate one replication and audit exact metadata
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          IRTREE_REP_FROM: "1"
+          IRTREE_REP_TO: "1"
+          IRTREE_SEED_SCHEME: main
+          IRTREE_ORACLE_DRAWS: "1"
+          IRTREE_REQUIRE_FROZEN: "1"
+          IRTREE_OUT: results_expansion56
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          Rscript main_sim.R
+          Rscript - <<'RS'
+          source("sim_core.R")
+          cnd <- Sys.getenv("IRTREE_COND")
+          grid <- read_grid("conditions_56.csv")
+          row <- grid[grid$condition_id==cnd,,drop=FALSE]
+          x <- readRDS(sprintf("results_expansion56/%s/rep_0001.rds",cnd))
+          stopifnot(nrow(x$meta)==1,as.character(x$meta$condition_id[1])==cnd,
+            x$meta$rep[1]==1,x$meta$seed[1]==data_seed(row,1,"main"),
+            identical(as.character(x$meta$manifest_id[1]),"ab03dffdf580"),
+            setequal(as.character(x$results$method),c("Oracle1","RankK","RankK2","BH")),
+            all(as.character(x$results$status)!="ERROR"))
+          cat("EXPANSION_PILOT_VALID",cnd,"\n")
+          RS
+      - name: Stage result for merge
+        working-directory: sim
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          mkdir -p "pilot_out/$COND"
+          cp "results_expansion56/$COND/rep_0001.rds" "pilot_out/$COND/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: expansion-pilot-${{ matrix.condition }}
+          path: sim/pilot_out/
+          retention-days: 30
+          if-no-files-found: error
+  merge:
+    needs: compute
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: expansion-pilot-*
+          path: incoming
+          merge-multiple: true
+      - name: Merge only new files, never overwrite prior results
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin results
+          git switch -C results origin/results
+          count=0
+          for cnd in C033 C036 C045 C048; do
+            src="incoming/$cnd/rep_0001.rds"
+            dst="sim/results_expansion56/$cnd/rep_0001.rds"
+            test -s "$src"
+            if [ -e "$dst" ]; then
+              cmp -s "$src" "$dst" || { echo "::error::Different existing result: $dst"; exit 1; }
+            else
+              mkdir -p "$(dirname "$dst")"
+              cp "$src" "$dst"
+              count=$((count+1))
+            fi
+          done
+          git add -f sim/results_expansion56
+          if ! git diff --cached --quiet; then
+            git commit -m "Pilot full56 expansion: four one-replication paired cells"
+            git push origin results
+          fi
+          echo "EXPANSION_PILOT_MERGE_PASS: $count new files" >> "$GITHUB_STEP_SUMMARY"
