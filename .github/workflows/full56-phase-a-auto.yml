@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 135
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 4
       matrix:
         condition: [C033, C034, C035, C036, C037, C038, C039, C040, C041, C042, C043, C044, C045, C046, C048, C049, C051, C052, C054, C055]
     steps:
@@ -116,6 +116,9 @@ jobs:
           retention-days: 14
           if-no-files-found: error
   merge:
+    # Merge successful condition artifacts even if another condition's upload fails.
+    # A failed upload must never discard already-computed results from other jobs.
+    if: ${{ always() && needs.compute.result != 'cancelled' }}
     needs: compute
     runs-on: ubuntu-22.04
     steps:
@@ -123,6 +126,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
+        # Some matrix uploads can fail transiently; merge all successful uploads.
         with:
           pattern: phase-a-*
           path: incoming/
