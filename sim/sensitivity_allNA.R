@@ -126,10 +126,13 @@ for(rep in selected$rep) {
 summary<-do.call(rbind,ans);details<-do.call(rbind,node_diagnostics)
 write.csv(summary,sprintf("../sensitivity_out/%s_comparison.csv",cond),row.names=FALSE)
 write.csv(details,sprintf("../sensitivity_out/%s_nodes.csv",cond),row.names=FALSE)
-if(length(decision_changes)) write.csv(do.call(rbind,decision_changes),
+if(length(decision_changes)) {
+ write.csv(do.call(rbind,decision_changes),
  sprintf("../sensitivity_out/%s_changes.csv",cond),row.names=FALSE)
-else write.csv(data.frame(condition=character(),rep=integer(),method=character(),item=integer(),node=character()),
+} else {
+ write.csv(data.frame(condition=character(),rep=integer(),method=character(),item=integer(),node=character()),
  sprintf("../sensitivity_out/%s_changes.csv",cond),row.names=FALSE)
+}
 if(length(errors)) write.csv(do.call(rbind,errors),sprintf("../sensitivity_out/%s_errors.csv",cond),row.names=FALSE)
 cat(cond," completed 5 replications / 4 methods, node decision changes:",
  sum(summary$node_changes),"item decision changes:",sum(summary$item_changes),"\n")
