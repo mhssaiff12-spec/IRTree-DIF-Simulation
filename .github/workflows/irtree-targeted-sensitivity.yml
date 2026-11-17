@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        condition: [C047, C050]
+        condition: [C047, C048]
     steps:
       - uses: actions/checkout@v4
         with:
