@@ -1,0 +1,106 @@
+name: IRTree C032-92 RankK2 A-B-C isolated R session diagnosis
+on:
+  push:
+    paths: ['.github/workflows/irtree-c032-triplet-diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  triplet:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Obtain exact original RDS in read-only mode
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p input/C032 diagnostic_out
+          git show origin/results:sim/results_core8/C032/rep_0092.rds > input/C032/rep_0092.rds
+          test -s input/C032/rep_0092.rds
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+          use-public-rspm: false
+      - name: Install frozen package versions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Verify original manifest
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+        run: |
+          Rscript - <<'RS'
+          fm<-read.csv('FROZEN_MANIFEST.csv')
+          f<-fm[fm$kind=='file_md5',]
+          stopifnot(all(unname(tools::md5sum(f$name))==f$value))
+          p<-fm[fm$kind=='package',]
+          stopifnot(all(vapply(seq_len(nrow(p)),function(i)as.character(packageVersion(p$name[i]))==p$value[i],logical(1))))
+          stopifnot(R.version.string==fm$value[fm$kind=='R'])
+          stopifnot(paste(RNGkind(),collapse='/')==fm$value[fm$kind=='RNG'])
+          stopifnot(substr(unname(tools::md5sum('FROZEN_MANIFEST.csv')),1,12)=='ab03dffdf580')
+          RS
+      - name: Separate fresh R session 1 — B vs C
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: Rscript --vanilla diagnose_C032_92_RankK2.R session1
+      - name: Separate fresh R session 2 — independent B repeat
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: Rscript --vanilla diagnose_C032_92_RankK2.R session2
+      - name: Produce A-B-C comparison CSV and identify largest discrepancy
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+        run: |
+          Rscript --vanilla - <<'RS'
+          orig <- readRDS('../input/C032/rep_0092.rds')
+          a <- orig$nodes[orig$nodes$method=='RankK2',c('item','node','p')]
+          names(a)[3] <- 'p_A_saved_RDS'
+          b <- read.csv('../diagnostic_out/session1_raw_p.csv')
+          c <- read.csv('../diagnostic_out/session2_raw_p.csv')
+          stopifnot(nrow(a)==60L,nrow(b)==60L,nrow(c)==60L)
+          out <- merge(merge(a,b[,c('item','node','p_B','p_C','LR_B','LR_C','converged_B','converged_C','removed')],by=c('item','node')),c[,c('item','node','p_B','converged_B')],by=c('item','node'),suffixes=c('','_session2'))
+          names(out)[names(out)=='p_B']<-'p_B_fresh_unfiltered'
+          names(out)[names(out)=='p_C']<-'p_C_fresh_filtered'
+          names(out)[names(out)=='p_B_session2']<-'p_B_fresh_session2'
+          out$A_minus_B <- out$p_A_saved_RDS-out$p_B_fresh_unfiltered
+          out$B_minus_C <- out$p_B_fresh_unfiltered-out$p_C_fresh_filtered
+          out$A_minus_C <- out$p_A_saved_RDS-out$p_C_fresh_filtered
+          out$B_session1_minus_B_session2 <- out$p_B_fresh_unfiltered-out$p_B_fresh_session2
+          out <- out[order(match(out$node,c('M','D','E')),out$item),]
+          stopifnot(nrow(out)==60L,all(is.finite(as.matrix(out[,c('p_A_saved_RDS','p_B_fresh_unfiltered','p_C_fresh_filtered','p_B_fresh_session2')]))))
+          write.csv(out,'../diagnostic_out/C032_rep92_RankK2_ABC_60.csv',row.names=FALSE)
+          ma <- which.max(abs(out$A_minus_C))
+          mb <- which.max(abs(out$B_minus_C))
+          s <- data.frame(condition='C032',rep=92L,method='RankK2',
+            A_minus_C_max_abs=max(abs(out$A_minus_C)),
+            A_minus_C_item=out$item[ma],A_minus_C_node=out$node[ma],
+            A_minus_B_max_abs=max(abs(out$A_minus_B)),
+            B_minus_C_max_abs=max(abs(out$B_minus_C)),
+            B_minus_C_item=out$item[mb],B_minus_C_node=out$node[mb],
+            B_session_variation_max_abs=max(abs(out$B_session1_minus_B_session2)),
+            identical_session_anchors=identical(read.csv('../diagnostic_out/metadata_session1.csv')$anchors,read.csv('../diagnostic_out/metadata_session2.csv')$anchors),
+            anchors=read.csv('../diagnostic_out/metadata_session1.csv')$anchors)
+          stopifnot(s$identical_session_anchors,all(out$converged_B),all(out$converged_C),all(out$converged_B_session2))
+          write.csv(s,'../diagnostic_out/C032_rep92_RankK2_ABC_summary.csv',row.names=FALSE)
+          print(s)
+          RS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: C032-92-RankK2-A-B-C-two-sessions
+          path: diagnostic_out/
+          if-no-files-found: warn
+          retention-days: 30
