@@ -1,0 +1,187 @@
+name: IRTree all-NA corrected fixed 140 after pilot
+on:
+  workflow_run:
+    workflows: ['IRTree all-NA corrected C032 rep92 pilot and tightened convergence']
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sensitivity:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        condition: [C029, C030, C031, C032, C033, C034, C035, C036, C037, C038, C039, C040, C041, C042, C043, C044, C045, C046, C047, C048, C049, C050, C051, C052, C053, C054, C055, C056]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Load metadata and locked RDS originals read-only
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p "input/$COND" sensitivity_out
+          git show origin/results:sim/audit28/replication_metadata.csv > input/replication_metadata.csv
+          python3 - <<'PY' > input/selected.txt
+          import csv,os
+          cond=os.environ['COND']
+          with open('sim/sensitivity_selected_140.csv') as f:
+              rows=list(csv.DictReader(f))
+          a=[r for r in rows if r['condition']==cond]
+          assert len(a)==5,len(a)
+          for r in a: print(r['rep'])
+          PY
+          while read -r rep; do
+            printf -v rf 'rep_%04d.rds' "$rep"
+            case "$COND" in
+              C029|C030|C031|C032|C047|C050|C053|C056) root="results_core8" ;;
+              *) root="results_expansion56" ;;
+            esac
+            git show "origin/results:sim/$root/$COND/$rf" > "input/$COND/$rf"
+            test -s "input/$COND/$rf"
+          done < input/selected.txt
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+          use-public-rspm: false
+      - name: Install original pinned packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Frozen manifest verification
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+        run: |
+          Rscript - <<'RS'
+          m<-read.csv("FROZEN_MANIFEST.csv")
+          f<-m[m$kind=="file_md5",]
+          stopifnot(all(unname(tools::md5sum(f$name))==f$value))
+          p<-m[m$kind=="package",]
+          stopifnot(all(vapply(seq_len(nrow(p)),function(i)as.character(packageVersion(p$name[i]))==p$value[i],logical(1))))
+          stopifnot(R.version.string==m$value[m$kind=="R"])
+          stopifnot(paste(RNGkind(),collapse="/")==m$value[m$kind=="RNG"])
+          stopifnot(substr(unname(tools::md5sum("FROZEN_MANIFEST.csv")),1,12)=="ab03dffdf580")
+          RS
+      - name: Refit fixed 5 replicas with corrected focal mean extraction
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: Rscript sensitivity_allNA_corrected.R
+      - name: Validate outputs for 5 replicas
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          python3 - <<'PY'
+          import csv,os,math
+          cond=os.environ['COND']
+          def read(s):
+              with open(f'sensitivity_out/{cond}_{s}.csv') as f:return list(csv.DictReader(f))
+          s=read('selection');m=read('comparison');n=read('nodes')
+          assert len(s)==5 and len(m)==20 and len(n)==60,(len(s),len(m),len(n))
+          assert all(math.isfinite(float(x['filtered_link_mean'])) for x in n)
+          assert all(math.isfinite(float(x['link_difference'])) for x in n)
+          print(cond, 'PASS', len(m),'method reps',len(n),'nodes',
+                'failed links:',sum(x['link_converged']!='TRUE' for x in n))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corrected-allNA-${{ matrix.condition }}
+          path: sensitivity_out/
+          if-no-files-found: error
+          retention-days: 30
+
+  aggregate:
+    needs: [sensitivity]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Retrieve CSV artifacts from all 28 conditions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: corrected-allNA-*
+          merge-multiple: true
+          path: combined
+      - name: Aggregate and validate completed outputs
+        run: |
+          python3 - <<'PY'
+          import csv,glob,os,math,collections
+          os.makedirs('summary',exist_ok=True)
+          def read(pattern):
+              data=[]
+              for f in sorted(glob.glob('combined/'+pattern)):
+                  with open(f,newline='') as h:data+=list(csv.DictReader(h))
+              return data
+          selections=read('C*_selection.csv')
+          node=read('C*_nodes.csv')
+          comp=read('C*_comparison.csv')
+          changes=read('C*_changes.csv')
+          errs=read('C*_errors.csv')
+          assert len(selections)==140,len(selections)
+          assert len(comp)==560,len(comp)
+          assert len(node)==1680,len(node)
+          assert len({(r['condition'],r['rep']) for r in selections})==140
+          for z in node:
+              assert math.isfinite(float(z['filtered_link_mean'])),z
+              assert math.isfinite(float(z['link_difference'])),z
+          failed_links=sum((z['link_converged']!='TRUE' or z['link_failed']!='0') for z in node)
+          failed_tests=sum(int(z['failed_tests']) for z in comp)
+          nonconverged=sum(int(z['nonconverged_filtered']) for z in comp)
+          grouped=collections.defaultdict(list)
+          detail_key={(x['condition'],x['rep'],x['method']):(x['tree'],x['dif_node'],x['shift']) for x in comp}
+          for x in node:
+              key=detail_key[(x['condition'],x['rep'],x['method'])]
+              grouped[key].append(x)
+          summaries=[]
+          for key,rows in sorted(grouped.items()):
+              subset=[x for x in comp if (x['tree'],x['dif_node'],x['shift'])==key]
+              summaries.append(dict(tree=key[0],dif_node=key[1],shift=key[2],
+                n_node_rows=len(rows),n_method_reps=len(subset),
+                max_abs_link_difference=max(abs(float(x['link_difference'])) for x in rows),
+                mean_abs_link_difference=sum(abs(float(x['link_difference'])) for x in rows)/len(rows),
+                max_abs_p_difference=max(float(x['max_p_abs_diff']) for x in subset),
+                node_decision_agreement=sum(float(x['node_agreement']) for x in subset)/len(subset),
+                item_decision_agreement=sum(float(x['item_agreement']) for x in subset)/len(subset),
+                failed_links=sum(x['link_converged']!='TRUE' for x in rows),
+                nonconverged_LR_tests=sum(int(x['nonconverged_filtered']) for x in subset),
+                failed_LR_tests=sum(int(x['failed_tests']) for x in subset)))
+          def write(name,rows):
+              if not rows:return
+              with open('summary/'+name,'w',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+          write('allNA_selected_140_verified.csv',selections)
+          write('allNA_comparison_560_corrected.csv',comp)
+          write('allNA_nodes_1680_corrected.csv',node)
+          write('allNA_grouped_corrected.csv',summaries)
+          write('allNA_decision_changes.csv',changes)
+          write('allNA_LR_errors.csv',errs)
+          status=[dict(tested_replicates=140,method_replications=560,node_rows=1680,
+            max_abs_p_diff=max(float(z['max_p_abs_diff']) for z in comp),
+            max_abs_link_diff=max(abs(float(z['link_difference'])) for z in node),
+            node_decision_agreement=sum(float(z['node_agreement']) for z in comp)/len(comp),
+            item_decision_agreement=sum(float(z['item_agreement']) for z in comp)/len(comp),
+            changed_nodes=sum(int(z['node_changes']) for z in comp),
+            changed_items=sum(int(z['item_changes']) for z in comp),
+            failed_links=failed_links,nonconverged_lr_tests=nonconverged,
+            failed_lr_tests=failed_tests)]
+          write('allNA_overall_corrected.csv',status)
+          print(status[0])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corrected-allNA-140-aggregated-CSV
+          path: summary/
+          retention-days: 30
