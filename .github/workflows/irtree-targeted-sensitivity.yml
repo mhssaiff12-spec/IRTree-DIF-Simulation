@@ -1,0 +1,99 @@
+name: IRTree targeted numerical sensitivity (read-only originals)
+on:
+  push:
+    paths:
+      - '.github/workflows/irtree-targeted-sensitivity.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sensitivity:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        condition: [C047, C050]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Retrieve one original RDS from results without writing
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          if [ "$COND" = C047 ]; then SRC="sim/results_core8/$COND/rep_0001.rds"; else SRC="sim/results_expansion56/$COND/rep_0001.rds"; fi
+          mkdir -p original
+          git show "origin/results:$SRC" > "original/$COND.rds"
+          test -s "original/$COND.rds"
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+          use-public-rspm: false
+      - name: Install frozen R environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Independently regenerate one frozen-seed result in an isolated directory
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          IRTREE_REP_FROM: '1'
+          IRTREE_REP_TO: '1'
+          IRTREE_SEED_SCHEME: main
+          IRTREE_REQUIRE_FROZEN: '1'
+          IRTREE_ORACLE_DRAWS: '1'
+          IRTREE_OUT: ../sensitivity_output
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: Rscript main_sim.R
+      - name: Compare numerical metrics and warning counts with originals
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          mkdir -p diagnostics
+          Rscript - <<'RS'
+          cond <- Sys.getenv("COND")
+          old <- readRDS(file.path("original",paste0(cond,".rds")))
+          new <- readRDS(file.path("sensitivity_output",cond,"rep_0001.rds"))
+          stopifnot(old$meta$condition_id==new$meta$condition_id,
+                    old$meta$rep==new$meta$rep,
+                    old$meta$seed==new$meta$seed,
+                    old$meta$manifest_id==new$meta$manifest_id)
+          x <- old$results; y <- new$results
+          stopifnot(setequal(x$method,y$method), !any(x$status=="ERROR"), !any(y$status=="ERROR"))
+          a <- merge(x,y,by="method",suffixes=c(".old",".new"))
+          metrics <- c("power","FPR","FDP","anchor_contamination","node_power")
+          rows <- list()
+          for (m in metrics) {
+            ox <- paste0(m,".old"); nx <- paste0(m,".new")
+            if (!(ox %in% names(a) && nx %in% names(a))) next
+            z <- suppressWarnings(as.numeric(a[[ox]])-as.numeric(a[[nx]]))
+            rows[[length(rows)+1L]] <- data.frame(metric=m,
+              max_abs_difference=if(all(is.na(z))) NA_real_ else max(abs(z),na.rm=TRUE),
+              n_compared=sum(!is.na(z)))
+          }
+          out <- if(length(rows)) do.call(rbind,rows) else data.frame(metric="none",max_abs_difference=NA_real_,n_compared=0)
+          write.csv(out,file.path("diagnostics",paste0(cond,"_metric_differences.csv")),row.names=FALSE)
+          summary <- data.frame(condition=cond,
+            original_warnings=old$meta$n_warnings_total,
+            regenerated_warnings=new$meta$n_warnings_total,
+            original_link_OK=sum(old$links$link_status=="OK"),
+            regenerated_link_OK=sum(new$links$link_status=="OK"))
+          write.csv(summary,file.path("diagnostics",paste0(cond,"_warnings.csv")),row.names=FALSE)
+          cat("### ",cond," sensitivity comparison\n\n",sep="",file=Sys.getenv("GITHUB_STEP_SUMMARY"),append=TRUE)
+          capture.output(print(out),print(summary),file=Sys.getenv("GITHUB_STEP_SUMMARY"),append=TRUE)
+          if(any(out$max_abs_difference>1e-7,na.rm=TRUE)) stop("Detected change in original versus regenerated metrics")
+          RS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: numerical-sensitivity-${{ matrix.condition }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
