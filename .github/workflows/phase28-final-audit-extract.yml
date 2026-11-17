@@ -157,6 +157,7 @@ jobs:
           }))
           write.csv(summary_count,file.path(out,"condition_integrity_summary.csv"),row.names=FALSE)
           if(length(errors)) {
+            cat("AUDIT_PROBLEM_TYPES\n"); print(sort(table(audit$problem[audit$problem!=""]),decreasing=TRUE)); cat("FIRST_30_EXAMPLES\n"); print(head(errors,30))
             writeLines(c("# AUDIT FAILED",paste0("- ",head(errors,200))),file.path(out,"REPORT.md"))
             stop(sprintf("AUDIT_FAIL: %d problems; see audit output",length(errors)))
           }
