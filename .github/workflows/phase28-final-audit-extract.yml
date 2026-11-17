@@ -65,7 +65,7 @@ jobs:
               audit <- data.frame(condition=cnd,replication=rep,exists=file.exists(fn),
                   readable=FALSE,metadata_ok=FALSE,methods_ok=FALSE,
                   metric_ok=FALSE,links_ok=FALSE,n_method_errors=NA_integer_,
-                  n_link_failures=NA_integer_,n_warnings=NA_integer_,problem="")
+                  n_link_failures=NA_integer_,n_warnings=NA_integer_,undefined_node_power_zero=0L,problem="")
               problem_fields <- character()
               if(!file.exists(fn)) {
                 problem_fields<-c(problem_fields,"MISSING")
@@ -112,9 +112,15 @@ jobs:
                       (if(null_truth) all(is.na(d$power)) else all(is.finite(d$power))) else FALSE
                     audit$metric_ok<-isTRUE(bounded)&&isTRUE(power_ok)
                     if(!audit$metric_ok)problem_fields<-c(problem_fields,"METRIC_RANGE_OR_POWER")
-                    if(!null_truth&&row$tree[1]=="EMD"&&row$dif_node[1]!="direction"&&
-                       "node_power"%in%names(d)&&any(!is.na(d$node_power))) {
-                      problem_fields<-c(problem_fields,"UNDEFINED_EMD_NODE_POWER")
+                    if(!null_truth&&row$tree[1]=="EMD"&&row$dif_node[1]!="direction") {
+                      # Simulator computes sum(flag & NA), which accidentally returns 0
+                      # if all flags are FALSE. Such zeros are NOT observed node power.
+                      # Preserve originals; mark these as structural NA in exported tables.
+                      audit$undefined_node_power_zero <- if("node_power"%in%names(d))
+                        sum(!is.na(d$node_power)) else 0L
+                      if("node_power"%in%names(d)) d$node_power <- NA_real_
+                      if("flags_on_dif_items_wrong_node"%in%names(d))
+                        d$flags_on_dif_items_wrong_node <- NA_real_
                     }
                     if(null_truth&&"node_power"%in%names(d)&&any(!is.na(d$node_power))) {
                       problem_fields<-c(problem_fields,"UNDEFINED_NULL_NODE_POWER")
@@ -153,7 +159,8 @@ jobs:
               metrics_valid=sum(z$metric_ok),links_structurally_valid=sum(z$links_ok),
               method_errors=sum(z$n_method_errors,na.rm=TRUE),
               link_non_OK=sum(z$n_link_failures,na.rm=TRUE),
-              total_warnings=sum(z$n_warnings,na.rm=TRUE))
+              total_warnings=sum(z$n_warnings,na.rm=TRUE),
+              raw_undefined_node_power_zeros=sum(z$undefined_node_power_zero,na.rm=TRUE))
           }))
           write.csv(summary_count,file.path(out,"condition_integrity_summary.csv"),row.names=FALSE)
           if(length(errors)) {
@@ -253,6 +260,7 @@ jobs:
             sprintf("- Method execution errors: %d",sum(audit$n_method_errors,na.rm=TRUE)),
             sprintf("- Linking outcomes other than OK: %d / 67200",sum(audit$n_link_failures,na.rm=TRUE)),
             sprintf("- Recorded warnings (counts; not necessarily independent): %d",sum(audit$n_warnings,na.rm=TRUE)),
+            sprintf("- RAW UNDEFINED EMD NODE-POWER ZEROS (re-coded to NA in extracts, source RDS unchanged): %d",sum(audit$undefined_node_power_zero)),
             "- Source design: sim/conditions_56.csv; analysis N=1000 only; K=10; 4 methods.",
             "- Frozen manifest: ab03dffdf580; 200 replications per condition.",
             "- Paired tree analysis: common data-generating seed, 14 MDE/EMD pairs.",
