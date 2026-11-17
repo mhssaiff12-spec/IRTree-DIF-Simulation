@@ -1,0 +1,106 @@
+name: IRTree all-NA sensitivity 140 replications
+on:
+  push:
+    paths:
+      - '.github/workflows/irtree-allNA-sensitivity140.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sensitivity:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        condition: [C029, C030, C031, C032, C033, C034, C035, C036, C037, C038, C039, C040, C041, C042, C043, C044, C045, C046, C047, C048, C049, C050, C051, C052, C053, C054, C055, C056]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Obtain metadata, never modify results branch
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p input sensitivity_out
+          git show origin/results:sim/audit28/replication_metadata.csv > input/replication_metadata.csv
+          test -s input/replication_metadata.csv
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+          use-public-rspm: false
+      - name: Install exact frozen package versions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Verify frozen code and environment
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+        run: |
+          Rscript - <<'RS'
+          manifest<-read.csv("FROZEN_MANIFEST.csv")
+          f<-manifest[manifest$kind=="file_md5",]
+          stopifnot(all(unname(tools::md5sum(f$name))==f$value))
+          p<-manifest[manifest$kind=="package",]
+          stopifnot(all(vapply(seq_len(nrow(p)),function(i)
+            as.character(packageVersion(p$name[i]))==p$value[i],logical(1))))
+          stopifnot(R.version.string==manifest$value[manifest$kind=="R"])
+          stopifnot(identical(paste(RNGkind(),collapse="/"),manifest$value[manifest$kind=="RNG"]))
+          stopifnot(substr(unname(tools::md5sum("FROZEN_MANIFEST.csv")),1,12)=="ab03dffdf580")
+          RS
+      - name: Select 5 per condition deterministically
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          IRTREE_SELECT_ONLY: '1'
+        run: Rscript sensitivity_allNA.R
+      - name: Retrieve only selected original RDS read-only
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          set -euo pipefail
+          mkdir -p "input/$COND"
+          tail -n +2 "sensitivity_out/${COND}_selection.csv" | while IFS=, read -r c rep rest; do
+            rep=$(printf "%s" "$rep" | tr -d '"')
+            printf -v rf 'rep_%04d.rds' "$rep"
+            case "$COND" in
+              C029|C030|C031|C032|C047|C050|C053|C056) root="results_core8" ;;
+              *) root="results_expansion56" ;;
+            esac
+            git show "origin/results:sim/$root/$COND/$rf" > "input/$COND/$rf"
+            test -s "input/$COND/$rf"
+          done
+      - name: Compare original vs all-NA-filtered node analyses (anchors frozen)
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: Rscript sensitivity_allNA.R
+      - name: Summarize outputs
+        if: always()
+        env:
+          COND: ${{ matrix.condition }}
+        run: |
+          echo "### $COND all-NA row removal audit" >> "$GITHUB_STEP_SUMMARY"
+          if test -f "sensitivity_out/${COND}_comparison.csv"; then
+            python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os,csv
+          cond=os.environ["COND"]
+          with open(f"sensitivity_out/{cond}_comparison.csv") as f: data=list(csv.DictReader(f))
+          print(f"Completed: {len(data)} method-replication pairs; node changes: {sum(int(x['node_changes']) for x in data)}; item changes: {sum(int(x['item_changes']) for x in data)}")
+          PY
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: allNA-${{ matrix.condition }}
+          path: sensitivity_out/
+          if-no-files-found: warn
+          retention-days: 30
