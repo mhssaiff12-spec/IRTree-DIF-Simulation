@@ -1,0 +1,81 @@
+name: IRTree all-NA corrected C032 rep92 pilot and tightened convergence
+on:
+  push:
+    paths:
+      - '.github/workflows/irtree-allNA-corrected-pilot.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pilot:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Read old RDS and replication metadata
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p input/C032 sensitivity_out
+          git show origin/results:sim/audit28/replication_metadata.csv > input/replication_metadata.csv
+          git show origin/results:sim/results_core8/C032/rep_0092.rds > input/C032/rep_0092.rds
+          test -s input/C032/rep_0092.rds
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+          use-public-rspm: false
+      - name: Install frozen R packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Verify exact frozen manifest and unchanged originals
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+        run: |
+          Rscript - <<'RS'
+          m<-read.csv("FROZEN_MANIFEST.csv")
+          f<-m[m$kind=="file_md5",]
+          stopifnot(all(unname(tools::md5sum(f$name))==f$value))
+          p<-m[m$kind=="package",]
+          stopifnot(all(vapply(seq_len(nrow(p)),function(i)as.character(packageVersion(p$name[i]))==p$value[i],logical(1))))
+          stopifnot(identical(R.version.string,m$value[m$kind=="R"]))
+          stopifnot(identical(paste(RNGkind(),collapse="/"),m$value[m$kind=="RNG"]))
+          stopifnot(substr(unname(tools::md5sum("FROZEN_MANIFEST.csv")),1,12)=="ab03dffdf580")
+          RS
+      - name: C032 rep92 pilot and C032 RankK2 refined fit
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: C032
+          IRTREE_PILOT_REP: '92'
+          IRTREE_REFINED_CHECK: '1'
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: Rscript sensitivity_allNA_corrected.R
+      - name: Check numeric outputs
+        run: |
+          python3 - <<'PY'
+          import csv,math
+          with open('sensitivity_out/C032_nodes.csv') as f: rows=list(csv.DictReader(f))
+          assert len(rows)==12,len(rows)
+          for r in rows:
+              assert math.isfinite(float(r['filtered_link_mean']))
+              assert math.isfinite(float(r['link_difference']))
+              assert r['link_converged']=='TRUE'
+          with open('sensitivity_out/C032_rep92_RankK2_refined_summary.csv') as f:
+              x=list(csv.DictReader(f))
+          assert len(x)==1 and int(x[0]['nonfinite_refined'])==0,x
+          print('PILOT PASS: 12 finite link means, refined check complete:',x)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: C032-rep92-corrected-pilot-refined
+          path: sensitivity_out/
+          if-no-files-found: warn
+          retention-days: 30
