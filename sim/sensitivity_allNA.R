@@ -22,6 +22,7 @@ selected <- data.frame(condition=cond,rep=c(high,random,none),
   n_warnings_total=md$n_warnings_total[match(c(high,random,none),md$replication)])
 dir.create("../sensitivity_out",showWarnings=FALSE)
 write.csv(selected,sprintf("../sensitivity_out/%s_selection.csv",cond),row.names=FALSE)
+if(Sys.getenv("IRTREE_SELECT_ONLY")=="1") quit(save="no")
 grid <- read_grid("conditions_56.csv"); row<-grid[grid$condition_id==cond,,drop=FALSE]
 stopifnot(nrow(row)==1L,as.integer(row$N)==1000L)
 args <- cond_args(row)
