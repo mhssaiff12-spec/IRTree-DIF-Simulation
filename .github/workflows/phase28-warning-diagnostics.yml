@@ -1,0 +1,118 @@
+name: DIAGNOSTIC warnings + convergence in 28-condition IRTree
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/phase28-warning-diagnostics.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: irtree-results-writer
+  cancel-in-progress: false
+jobs:
+  diagnostics:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restore original RDS read-only
+        run: |
+          git fetch origin results
+          git archive --format=tar origin/results sim/results_core8 sim/results_expansion56 | tar -xf -
+          mkdir -p warning_output
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+      - name: Inspect warning families and convergence separately
+        working-directory: sim
+        run: |
+          Rscript - <<'RS'
+          source("sim_core.R")
+          base<-c("C029","C030","C031","C032","C047","C050","C053","C056")
+          additional<-c("C033","C034","C035","C036","C037","C038","C039","C040","C041","C042",
+            "C043","C044","C045","C046","C048","C049","C051","C052","C054","C055")
+          conds<-sort(c(base,additional))
+          rows<-list();examples<-list();nr<-0L;ne<-0L
+          splittext<-function(s){
+            if(is.na(s)||!nzchar(s))return(character())
+            trimws(strsplit(as.character(s)," | ",fixed=TRUE)[[1]])
+          }
+          normalize<-function(s){
+            s<-gsub("[[:digit:]]+[.][[:digit:]]+","<num>",s)
+            s<-gsub("[[:digit:]]+","<int>",s)
+            substr(s,1,220)
+          }
+          for(cnd in conds){
+            folder<-if(cnd%in%base)"results_core8" else "results_expansion56"
+            for(rep in 1:200){
+              x<-readRDS(sprintf("%s/%s/rep_%04d.rds",folder,cnd,rep))
+              iss<-x$issues
+              if(is.data.frame(iss)&&nrow(iss))for(i in seq_len(nrow(iss))) {
+                nr<-nr+1L
+                row<-iss[i,,drop=FALSE]
+                texts<-splittext(as.character(row$text[1]))
+                rows[[nr]]<-data.frame(condition=cnd,rep=rep,method=as.character(row$method[1]),
+                  type=as.character(row$type[1]),count=as.numeric(row$n[1]),
+                  unique_messages_in_row=length(texts),stringsAsFactors=FALSE)
+                if(length(texts))for(t in texts){
+                  ne<-ne+1L
+                  examples[[ne]]<-data.frame(condition=cnd,method=as.character(row$method[1]),
+                    type=as.character(row$type[1]),message_family=normalize(t),example=substr(t,1,300))
+                }
+              }
+            }
+          }
+          d<-if(length(rows))do.call(rbind,rows)else data.frame()
+          e<-if(length(examples))do.call(rbind,examples)else data.frame()
+          if(nrow(d)) {
+            agg<-aggregate(d$count,list(method=d$method,type=d$type),sum)
+            names(agg)[3]<-"total_warning_instances"
+            write.csv(agg,"../warning_output/warnings_by_method_type.csv",row.names=FALSE)
+            write.csv(aggregate(d$count,list(condition=d$condition,type=d$type),sum),
+              "../warning_output/warnings_by_condition_type.csv",row.names=FALSE)
+          }
+          if(nrow(e)){
+            counts<-aggregate(rep(1,nrow(e)),e[c("type","message_family")],sum)
+            names(counts)[3]<-"rows_with_message"
+            counts<-counts[order(-counts$rows_with_message),,drop=FALSE]
+            write.csv(counts,"../warning_output/warning_message_families.csv",row.names=FALSE)
+            write.csv(head(e,100),"../warning_output/warning_examples_100.csv",row.names=FALSE)
+            cat("## Top warning families\n\n")
+            print(head(counts,25),row.names=FALSE)
+          }
+          cat(sprintf("Warning instance count in issues: %.0f; distinct issue rows: %d; distinct text snippets: %d\n",
+            if(nrow(d))sum(d$count,na.rm=TRUE)else 0,nrow(d),nrow(e)))
+          writeLines(c("# Warning diagnostic",
+            sprintf("- Issue-warning instances: %.0f",if(nrow(d))sum(d$count,na.rm=TRUE)else 0),
+            sprintf("- Issue rows: %d",nrow(d)),
+            sprintf("- Message-family rows: %d",if(nrow(e))nrow(unique(e[c("type","message_family")]))else 0),
+            "- These warnings have to be classified by their content; lack of ERROR status is not a substitute for convergence verification.",
+            "- Simulator RDS files were read without mutation."),
+            "../warning_output/REPORT.md")
+          RS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: final28-warning-diagnostic
+          path: warning_output/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Publish report to results branch without touching simulations
+        if: success()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin results
+          rm -rf sim/results_core8 sim/results_expansion56
+          git switch -C results origin/results
+          mkdir -p sim/audit28
+          cp warning_output/* sim/audit28/
+          git add -f sim/audit28
+          if ! git diff --cached --quiet; then
+            git commit -m "Classify all 28-condition warning families"
+            git push origin results
+          fi
+          cat warning_output/REPORT.md >> "$GITHUB_STEP_SUMMARY"
