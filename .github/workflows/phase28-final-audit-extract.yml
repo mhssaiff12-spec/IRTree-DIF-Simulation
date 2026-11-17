@@ -1,0 +1,294 @@
+name: FINAL AUDIT + EXTRACT 28 conditions 5600 RDS
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/phase28-final-audit-extract.yml"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: irtree-results-writer
+  cancel-in-progress: false
+jobs:
+  verify_extract:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Materialize 5600 historical RDS; never overwrite simulation results
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          git archive --format=tar origin/results sim/results_core8 sim/results_expansion56 | tar -xf -
+          mkdir -p audit28_output
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+      - name: Integrity audit, descriptive extraction and paired contrasts
+        working-directory: sim
+        run: |
+          Rscript - <<'RS'
+          source("sim_core.R")
+          grid <- read_grid("conditions_56.csv"); validate_grid(grid)
+          main_conds <- c("C029","C030","C031","C032","C047","C050","C053","C056")
+          add_conds <- c("C033","C034","C035","C036","C037","C038","C039","C040",
+             "C041","C042","C043","C044","C045","C046","C048","C049",
+             "C051","C052","C054","C055")
+          conds <- sort(c(main_conds,add_conds))
+          methods <- c("Oracle1","RankK","RankK2","BH")
+          out <- "../audit28_output"
+          expected_manifest <- "ab03dffdf580"
+          errors <- character()
+          issues <- character()
+          records <- vector("list",5600L)
+          metric_list <- vector("list",5600L)
+          link_list <- vector("list",5600L)
+          meta_list <- vector("list",5600L)
+          k <- 0L
+          problem <- function(msg) { errors <<- c(errors,msg) }
+          metrics <- c("FPR","power","FDP","any_FP","TP","FP","FN",
+             "anchor_size","anchor_contaminated","anchor_precision",
+             "clean_items_removed","contaminated_items_excluded",
+             "node_power","FP_node_tests","flags_on_dif_items_wrong_node")
+          for(cnd in conds) {
+            row <- grid[grid$condition_id==cnd,,drop=FALSE]
+            folder <- if(cnd %in% main_conds) "results_core8" else "results_expansion56"
+            loc <- file.path(folder,cnd)
+            filenames <- list.files(loc,pattern="^rep_[0-9]{4}[.]rds$")
+            if(length(filenames)!=200L) problem(sprintf("%s: count=%d, expected=200",cnd,length(filenames)))
+            for(rep in 1:200) {
+              k <- k+1L
+              fn <- sprintf("%s/rep_%04d.rds",loc,rep)
+              audit <- data.frame(condition=cnd,replication=rep,exists=file.exists(fn),
+                  readable=FALSE,metadata_ok=FALSE,methods_ok=FALSE,
+                  metric_ok=FALSE,links_ok=FALSE,n_method_errors=NA_integer_,
+                  n_link_failures=NA_integer_,n_warnings=NA_integer_,problem="")
+              problem_fields <- character()
+              if(!file.exists(fn)) {
+                problem_fields<-c(problem_fields,"MISSING")
+              } else {
+                x<-tryCatch(readRDS(fn),error=function(e)e)
+                if(inherits(x,"error")) {
+                  problem_fields<-c(problem_fields,paste0("BAD_RDS:",conditionMessage(x)))
+                } else {
+                  audit$readable<-TRUE
+                  m<-x$meta; d<-x$results; l<-x$links
+                  needed_meta<-c("condition_id","rep","seed","seed_scheme","manifest_id","N","shift","impact","tree","dif_node","K")
+                  # manifest_id is added at write time in the original simulator
+                  metadata_ok<-is.data.frame(m)&&nrow(m)==1L&&all(needed_meta %in% names(m))
+                  if(metadata_ok) metadata_ok <- 
+                    identical(as.character(m$condition_id[1]),cnd)&&
+                    as.integer(m$rep[1])==rep&&
+                    as.integer(m$seed[1])==data_seed(row,rep,"main")&&
+                    identical(as.character(m$seed_scheme[1]),"main")&&
+                    identical(as.character(m$manifest_id[1]),expected_manifest)&&
+                    as.integer(m$N[1])==as.integer(row$N[1])&&
+                    abs(as.numeric(m$shift[1])-row$shift[1])<1e-10&&
+                    abs(as.numeric(m$impact[1])-row$impact[1])<1e-10&&
+                    identical(as.character(m$tree[1]),as.character(row$tree[1]))&&
+                    identical(as.character(m$dif_node[1]),as.character(row$dif_node[1]))&&
+                    as.integer(m$K[1])==10L
+                  audit$metadata_ok<-isTRUE(metadata_ok)
+                  if(!isTRUE(metadata_ok)) problem_fields<-c(problem_fields,"METADATA_MISMATCH")
+                  goodmethods<-is.data.frame(d)&&nrow(d)==4L&&all(c("method","status")%in%names(d))&&
+                    setequal(as.character(d$method),methods)&&!anyDuplicated(as.character(d$method))
+                  audit$methods_ok<-isTRUE(goodmethods)
+                  if(!goodmethods) problem_fields<-c(problem_fields,"METHOD_STRUCTURE")
+                  if(goodmethods) {
+                    ne<-sum(is.na(d$status)|as.character(d$status)=="ERROR")
+                    audit$n_method_errors<-ne
+                    if(ne>0L) problem_fields<-c(problem_fields,"METHOD_ERROR")
+                    # Metric range check with only metrics available from this simulation
+                    bounds<-intersect(c("FPR","FDP","power","any_FP","anchor_precision","node_power"),names(d))
+                    bounded<-all(vapply(bounds,function(q) {
+                      z<-suppressWarnings(as.numeric(d[[q]]))
+                      all(is.na(z)| (is.finite(z)&z>=-1e-8&z<=1+1e-8))
+                    },logical(1)))
+                    null_truth<-row$shift[1]==0
+                    power_ok<-if("power"%in%names(d)) 
+                      (if(null_truth) all(is.na(d$power)) else all(is.finite(d$power))) else FALSE
+                    audit$metric_ok<-isTRUE(bounded)&&isTRUE(power_ok)
+                    if(!audit$metric_ok)problem_fields<-c(problem_fields,"METRIC_RANGE_OR_POWER")
+                    if(!null_truth&&row$tree[1]=="EMD"&&row$dif_node[1]!="direction"&&
+                       "node_power"%in%names(d)&&any(!is.na(d$node_power))) {
+                      problem_fields<-c(problem_fields,"UNDEFINED_EMD_NODE_POWER")
+                    }
+                    if(null_truth&&"node_power"%in%names(d)&&any(!is.na(d$node_power))) {
+                      problem_fields<-c(problem_fields,"UNDEFINED_NULL_NODE_POWER")
+                    }
+                    d$condition<-cnd;d$replication<-rep
+                    metric_list[[k]]<-d
+                  }
+                  links_ok<-is.data.frame(l)&&nrow(l)==12L&&all(c("method","node","link_status")%in%names(l))&&
+                    all(vapply(methods,function(mt)sum(l$method==mt)==3L,logical(1)))
+                  audit$links_ok<-isTRUE(links_ok)
+                  if(!links_ok)problem_fields<-c(problem_fields,"LINK_STRUCTURE")
+                  if(links_ok) {
+                    audit$n_link_failures<-sum(is.na(l$link_status)|as.character(l$link_status)!="OK")
+                    l$condition<-cnd;l$replication<-rep
+                    link_list[[k]]<-l
+                  }
+                  audit$n_warnings<-if(is.data.frame(m)&&"n_warnings_total"%in%names(m)) 
+                    as.integer(m$n_warnings_total[1]) else NA_integer_
+                  if(is.data.frame(m)&&nrow(m)==1){
+                    m$condition<-cnd;m$replication<-rep
+                    meta_list[[k]]<-m
+                  }
+                }
+              }
+              audit$problem<-paste(problem_fields,collapse=";")
+              records[[k]]<-audit
+              if(length(problem_fields)) problem(sprintf("%s rep_%04d: %s",cnd,rep,audit$problem))
+            }
+          }
+          audit <- do.call(rbind,records);rownames(audit)<-NULL
+          write.csv(audit,file.path(out,"replication_audit_5600.csv"),row.names=FALSE,na="")
+          summary_count <- do.call(rbind,lapply(conds,function(cnd){
+            z<-audit[audit$condition==cnd,,drop=FALSE]
+            data.frame(condition=cnd,files=sum(z$exists),readable=sum(z$readable),
+              metadata_valid=sum(z$metadata_ok),methods_valid=sum(z$methods_ok),
+              metrics_valid=sum(z$metric_ok),links_structurally_valid=sum(z$links_ok),
+              method_errors=sum(z$n_method_errors,na.rm=TRUE),
+              link_non_OK=sum(z$n_link_failures,na.rm=TRUE),
+              total_warnings=sum(z$n_warnings,na.rm=TRUE))
+          }))
+          write.csv(summary_count,file.path(out,"condition_integrity_summary.csv"),row.names=FALSE)
+          if(length(errors)) {
+            writeLines(c("# AUDIT FAILED",paste0("- ",head(errors,200))),file.path(out,"REPORT.md"))
+            stop(sprintf("AUDIT_FAIL: %d problems; see audit output",length(errors)))
+          }
+          d<-do.call(rbind,metric_list)
+          l<-do.call(rbind,link_list)
+          m<-do.call(rbind,meta_list)
+          stopifnot(nrow(d)==22400L,nrow(l)==67200L,nrow(m)==5600L)
+          attr <- grid[match(d$condition,grid$condition_id),c("N","shift","impact","tree","dif_node"),drop=FALSE]
+          d<-cbind(d,attr)
+          write.csv(d,file.path(out,"replication_method_metrics.csv"),row.names=FALSE,na="")
+          write.csv(l,file.path(out,"replication_link_diagnostics.csv"),row.names=FALSE,na="")
+          # Keep compact metadata provenance, not raw identifying host fields
+          write.csv(m[,intersect(c("condition","replication","seed","manifest_id","N","shift","impact","tree","dif_node","K","n_warnings_total"),names(m)),drop=FALSE],
+            file.path(out,"replication_metadata.csv"),row.names=FALSE,na="")
+          keys<-split(seq_len(nrow(d)),interaction(d$condition,d$method,drop=TRUE))
+          summary_rows<-lapply(keys,function(ix){
+            a<-d[ix,,drop=FALSE];v<-a[1,c("condition","method","N","shift","impact","tree","dif_node")]
+            v$n_rep<-nrow(a)
+            for(q in intersect(metrics,names(d))) {
+              z<-suppressWarnings(as.numeric(a[[q]]));z<-z[is.finite(z)]
+              v[[paste0(q,"_mean")]]<-if(length(z))mean(z) else NA_real_
+              v[[paste0(q,"_mcse")]]<-if(length(z)>1)sd(z)/sqrt(length(z))else NA_real_
+              v[[paste0(q,"_n")]]<-length(z)
+            }
+            v
+          })
+          sm<-do.call(rbind,summary_rows)
+          sm<-sm[order(sm$condition,match(sm$method,methods)),,drop=FALSE]
+          rownames(sm)<-NULL
+          stopifnot(nrow(sm)==112L,all(sm$n_rep==200))
+          write.csv(sm,file.path(out,"summary_condition_method.csv"),row.names=FALSE,na="")
+          # Every MDE/EMD pair must share the generating design cell and rep-level data seed.
+          pairs<-do.call(rbind,lapply(conds[grid$tree[match(conds,grid$condition_id)]=="MDE"],function(cnd){
+            a<-grid[grid$condition_id==cnd,]
+            z<-grid[grid$N==a$N&grid$shift==a$shift&grid$impact==a$impact&
+                    grid$dif_node==a$dif_node&grid$tree=="EMD",,drop=FALSE]
+            stopifnot(nrow(z)==1,z$condition_id %in% conds)
+            data.frame(mde=cnd,emd=z$condition_id)
+          }))
+          stopifnot(nrow(pairs)==14)
+          contrasts<-list();ctr<-0L
+          for(p in seq_len(nrow(pairs))) {
+            aa<-pairs$mde[p];bb<-pairs$emd[p]
+            ad<-d[d$condition==aa,];bd<-d[d$condition==bb,]
+            ax<-ad[order(ad$replication,ad$method),]
+            bx<-bd[order(bd$replication,bd$method),]
+            stopifnot(identical(ax$replication,bx$replication),
+                      identical(as.character(ax$method),as.character(bx$method)),
+                      identical(as.integer(ax$seed),as.integer(bx$seed)))
+            for(mt in methods)for(q in intersect(metrics,c("FPR","power","FDP","any_FP",
+                     "anchor_contaminated","anchor_precision","node_power"))) {
+              za<-ax[ax$method==mt,q];zb<-bx[bx$method==mt,q]
+              delta<-as.numeric(zb)-as.numeric(za);delta<-delta[is.finite(delta)]
+              ctr<-ctr+1L
+              mu<-if(length(delta))mean(delta)else NA_real_
+              se<-if(length(delta)>1)sd(delta)/sqrt(length(delta))else NA_real_
+              contrasts[[ctr]]<-data.frame(condition_MDE=aa,condition_EMD=bb,method=mt,
+                metric=q,n=length(delta),mean_EMD_minus_MDE=mu,mcse=se,
+                ci95_low=mu-1.96*se,ci95_high=mu+1.96*se)
+            }
+          }
+          write.csv(do.call(rbind,contrasts),file.path(out,"paired_tree_contrasts.csv"),row.names=FALSE,na="")
+          ctr<-0L; contrasts<-list()
+          pp<-combn(methods,2,simplify=FALSE)
+          for(cnd in conds) {
+            z<-d[d$condition==cnd,]
+            for(p in pp)for(q in intersect(metrics,c("FPR","power","FDP","any_FP","anchor_contaminated","anchor_precision"))) {
+              x<-z[z$method==p[1],];y<-z[z$method==p[2],]
+              x<-x[order(x$replication),];y<-y[order(y$replication),]
+              stopifnot(identical(x$replication,y$replication))
+              diff<-as.numeric(x[[q]])-as.numeric(y[[q]])
+              diff<-diff[is.finite(diff)]
+              ctr<-ctr+1L
+              mu<-if(length(diff))mean(diff)else NA_real_
+              se<-if(length(diff)>1)sd(diff)/sqrt(length(diff))else NA_real_
+              contrasts[[ctr]]<-data.frame(condition=cnd,method_A=p[1],method_B=p[2],
+                 metric=q,n=length(diff),mean_A_minus_B=mu,mcse=se,
+                 ci95_low=mu-1.96*se,ci95_high=mu+1.96*se)
+            }
+          }
+          write.csv(do.call(rbind,contrasts),file.path(out,"paired_method_contrasts.csv"),row.names=FALSE,na="")
+          status<-as.data.frame(table(l$condition,l$method,l$link_status))
+          names(status)<-c("condition","method","link_status","count")
+          status<-status[status$count>0,,drop=FALSE]
+          write.csv(status,file.path(out,"link_status_counts.csv"),row.names=FALSE)
+          report<-c(
+            "# FINAL 28-CONDITION AUDIT: PASS",
+            sprintf("- RDS readable: %d/5600",sum(audit$readable)),
+            sprintf("- Metadata valid: %d/5600",sum(audit$metadata_ok)),
+            sprintf("- Method structures valid: %d/5600",sum(audit$methods_ok)),
+            sprintf("- Metric checks valid: %d/5600",sum(audit$metric_ok)),
+            sprintf("- Link structures valid: %d/5600",sum(audit$links_ok)),
+            sprintf("- Method execution errors: %d",sum(audit$n_method_errors,na.rm=TRUE)),
+            sprintf("- Linking outcomes other than OK: %d / 67200",sum(audit$n_link_failures,na.rm=TRUE)),
+            sprintf("- Recorded warnings (counts; not necessarily independent): %d",sum(audit$n_warnings,na.rm=TRUE)),
+            "- Source design: sim/conditions_56.csv; analysis N=1000 only; K=10; 4 methods.",
+            "- Frozen manifest: ab03dffdf580; 200 replications per condition.",
+            "- Paired tree analysis: common data-generating seed, 14 MDE/EMD pairs.",
+            "- A 95% interval in contrast files is a pointwise normal approximation based on MCSE; not multiplicity adjusted.",
+            "- Undefined null-DIF power and undefined EMD node power are kept NA.",
+            "- This audit validates files and internal structure, not independent correctness of simulation assumptions or methods.",
+            "- Do NOT state that this run verifies all 56 grid conditions or N=500.",
+            ""
+          )
+          writeLines(report,file.path(out,"REPORT.md"))
+          cat(paste(report,collapse="\n"))
+          RS
+      - name: Append report to GitHub Actions summary
+        if: always()
+        run: |
+          test ! -f audit28_output/REPORT.md || cat audit28_output/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: final28-audit-and-extracted-results
+          path: audit28_output/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Save verified reports only to results branch
+        if: success()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin results
+          git switch -C results origin/results
+          mkdir -p sim/audit28
+          cp audit28_output/* sim/audit28/
+          git add -f sim/audit28
+          if ! git diff --cached --quiet; then
+            git commit -m "Audit and extract 28-condition 5600-replication results"
+            git push origin results
+          fi
+          echo "### Audited CSVs are committed on results branch in sim/audit28" >> "$GITHUB_STEP_SUMMARY"
