@@ -1,8 +1,6 @@
 name: IRTree Phase A automatic N1000 expansion
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "23 */6 * * *"
 permissions:
   contents: write
 concurrency:
