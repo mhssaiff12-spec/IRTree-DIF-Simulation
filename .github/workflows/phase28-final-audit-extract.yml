@@ -292,6 +292,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin results
+          # Remove only temporary extracted RDS files in this disposable runner;
+          # otherwise git switch refuses to overwrite untracked paths already in results.
+          rm -rf sim/results_core8 sim/results_expansion56
           git switch -C results origin/results
           mkdir -p sim/audit28
           cp audit28_output/* sim/audit28/
