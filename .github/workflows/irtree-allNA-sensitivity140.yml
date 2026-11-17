@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - '.github/workflows/irtree-allNA-sensitivity140.yml'
+      - 'sim/sensitivity_allNA.R'
   workflow_dispatch:
 permissions:
   contents: read
