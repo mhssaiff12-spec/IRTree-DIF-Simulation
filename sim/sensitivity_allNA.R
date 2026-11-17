@@ -20,6 +20,19 @@ none <- sample(zero,1L)
 selected <- data.frame(condition=cond,rep=c(high,random,none),
   selection=c("highest1","highest2","random1","random2","zero_warning"),
   n_warnings_total=md$n_warnings_total[match(c(high,random,none),md$replication)])
+# Exact locked selection from the previously reviewed 140-row CSV.
+locked <- read.csv("sensitivity_selected_140.csv", stringsAsFactors=FALSE)
+stopifnot(nrow(locked)==140L, length(unique(paste(locked$condition,locked$rep)))==140L)
+fixed <- locked[locked$condition==cond,,drop=FALSE]
+stopifnot(nrow(fixed)==5L,identical(as.integer(fixed$rep),as.integer(selected$rep)),
+          identical(as.character(fixed$selection),as.character(selected$selection)),
+          identical(as.integer(fixed$n_warnings_total),as.integer(selected$n_warnings_total)))
+selected <- fixed
+pilot_rep <- Sys.getenv("IRTREE_PILOT_REP","")
+if(nzchar(pilot_rep)) {
+ stopifnot(cond=="C032",pilot_rep=="92",92L %in% selected$rep)
+ selected <- selected[selected$rep==92L,,drop=FALSE]
+}
 dir.create("../sensitivity_out",showWarnings=FALSE)
 write.csv(selected,sprintf("../sensitivity_out/%s_selection.csv",cond),row.names=FALSE)
 if(Sys.getenv("IRTREE_SELECT_ONLY")=="1") quit(save="no")
@@ -80,18 +93,63 @@ for(rep in selected$rep) {
      m<-mirt::multipleGroup(WW,1,group=G,itemtype="Rasch",
        invariance=c(paste0(key[[nd]],anchors),"free_means","free_var"),
        quadpts=Q,verbose=FALSE,technical=list(NCYCLES=1000))
-     c(value=mirt::coef(m,simplify=TRUE)$focal$means[1],
-       converged=as.numeric(isTRUE(mirt::extract.mirt(m,"converged"))))
+     fm <- as.numeric(unname(mirt::coef(m,simplify=TRUE)$focal$means))[1]
+     cv <- isTRUE(mirt::extract.mirt(m,"converged"))
+     list(value=fm,converged=cv,error="")
    },warning=function(w){nw<<-nw+1L;invokeRestart("muffleWarning")}),
-     error=function(e)c(value=NA_real_,converged=0))
+     error=function(e)list(value=NA_real_,converged=FALSE,error=conditionMessage(e)))
    origlink<-x$links[x$links$method==method & x$links$node==nd,,drop=FALSE]
    stopifnot(nrow(origlink)==1L)
    cnt$original_link_mean<-as.numeric(origlink$est_mean[1])
-   cnt$filtered_link_mean<-as.numeric(link["value"])
+   cnt$filtered_link_mean<-as.numeric(link$value)
    cnt$link_difference<-cnt$filtered_link_mean-cnt$original_link_mean
-   cnt$link_converged<-as.logical(link["converged"])
+   cnt$link_converged<-isTRUE(link$converged)
+   cnt$link_error<-link$error
+   cnt$link_failed<-as.integer(!isTRUE(link$converged) || !is.finite(link$value))
    cnt$filtered_warning_count<-nw
    node_diagnostics[[length(node_diagnostics)+1L]]<-cnt
+  }
+  if(Sys.getenv("IRTREE_REFINED_CHECK")=="1" && cond=="C032" &&
+      rep==92L && method=="RankK2") {
+    fine<-list()
+    for(nd in names(key)) {
+      W<-P[[nd]]; storage.mode(W)<-"numeric"; colnames(W)<-paste0(key[[nd]],ALL)
+      keep<-rowSums(!is.na(W))>0
+      for(filtered in c(FALSE,TRUE)) {
+        WD<-if(filtered) W[keep,,drop=FALSE] else W
+        GD<-if(filtered) droplevels(groups[keep]) else groups
+        for(j in ALL) {
+          anc<-paste0(key[[nd]],setdiff(anchors,j)); cand<-paste0(key[[nd]],j)
+          z<-tryCatch(suppressWarnings({
+            alt<-mirt::multipleGroup(WD,1,group=GD,itemtype="Rasch",
+              invariance=c(anc,"free_means","free_var"),method="EM",
+              quadpts=Q,verbose=FALSE,TOL=1e-6,technical=list(NCYCLES=5000))
+            nul<-mirt::multipleGroup(WD,1,group=GD,itemtype="Rasch",
+              invariance=c(anc,cand,"free_means","free_var"),method="EM",
+              quadpts=Q,verbose=FALSE,TOL=1e-6,technical=list(NCYCLES=5000))
+            stopifnot(isTRUE(mirt::extract.mirt(alt,"converged")),
+                      isTRUE(mirt::extract.mirt(nul,"converged")))
+            LR<-max(0,2*(as.numeric(logLik(alt))-as.numeric(logLik(nul))))
+            df<-mirt::extract.mirt(alt,"nest")-mirt::extract.mirt(nul,"nest")
+            data.frame(item=j,node=key[[nd]],filtered=filtered,
+                      p=pchisq(LR,df,lower.tail=FALSE),status="OK")
+          }), error=function(e)data.frame(item=j,node=key[[nd]],filtered=filtered,
+                                          p=NA_real_,status=conditionMessage(e)))
+          fine[[length(fine)+1L]]<-z
+        }
+      }
+    }
+    fine<-do.call(rbind,fine)
+    un<-fine[!fine$filtered,c("item","node","p","status")]
+    fi<-fine[fine$filtered,c("item","node","p","status")]
+    colnames(un)[3:4]<-c("p_unfiltered","status_unfiltered")
+    colnames(fi)[3:4]<-c("p_filtered","status_filtered")
+    pd<-merge(un,fi,by=c("item","node"),sort=FALSE)
+    pd$p_abs_diff<-abs(pd$p_unfiltered-pd$p_filtered)
+    stopifnot(nrow(pd)==60L)
+    write.csv(pd,"../sensitivity_out/C032_rep92_RankK2_refined_p.csv",row.names=FALSE)
+    cat("REFINED maximum |p_filtered-p_unfiltered| = ",
+        max(pd$p_abs_diff,na.rm=TRUE),"\n")
   }
   result<-do.call(rbind,out)
   result$p_BH_all<-p.adjust(result$p,"BH")
@@ -112,6 +170,13 @@ for(rep in selected$rep) {
    item_changes=sum(origitem!=newitem),
    nonconverged_filtered=sum(!result$converged),failed_tests=sum(!is.finite(result$p)))
   ans[[length(ans)+1L]]<-v
+  if(Sys.getenv("IRTREE_REFINED_CHECK")=="1" && cond=="C032" && rep==92L && method=="RankK2") {
+     write.csv(data.frame(condition=cond,rep=rep,method=method,
+       max_p_abs_diff_original=v$max_p_abs_diff,
+       max_p_abs_diff_refined=max(pd$p_abs_diff,na.rm=TRUE),
+       nonfinite_refined=sum(!is.finite(pd$p_abs_diff))),
+       "../sensitivity_out/C032_rep92_RankK2_refined_summary.csv",row.names=FALSE)
+  }
   if(any(merged$changed_node) || item_same<20) {
     bad<-merged[merged$changed_node | merged$item %in% names(origitem)[origitem!=newitem],]
     bad$condition<-cond;bad$rep<-rep;bad$method<-method
@@ -124,6 +189,13 @@ for(rep in selected$rep) {
  message(cond," rep=",rep," done")
 }
 summary<-do.call(rbind,ans);details<-do.call(rbind,node_diagnostics)
+if(any(!is.finite(details$filtered_link_mean))) {
+  stop("Filtered link means must be finite; inspect link_error before accepting results")
+}
+if(Sys.getenv("IRTREE_PILOT_REP")=="92") {
+  stopifnot(nrow(details)==12L,all(details$link_converged),
+            all(is.finite(details$filtered_link_mean)),all(is.finite(details$link_difference)))
+}
 write.csv(summary,sprintf("../sensitivity_out/%s_comparison.csv",cond),row.names=FALSE)
 write.csv(details,sprintf("../sensitivity_out/%s_nodes.csv",cond),row.names=FALSE)
 if(length(decision_changes)) {
