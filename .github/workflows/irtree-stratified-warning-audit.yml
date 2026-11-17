@@ -1,0 +1,126 @@
+name: IRTree stratified warning reproducibility audit
+on:
+  push:
+    paths:
+      - '.github/workflows/irtree-stratified-warning-audit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - {condition: C029, rep: 4, stratum: none, source: results_core8}
+          - {condition: C029, rep: 8, stratum: high, source: results_core8}
+          - {condition: C030, rep: 4, stratum: none, source: results_core8}
+          - {condition: C030, rep: 188, stratum: high, source: results_core8}
+          - {condition: C047, rep: 1, stratum: none, source: results_core8}
+          - {condition: C047, rep: 157, stratum: high, source: results_core8}
+          - {condition: C048, rep: 4, stratum: none, source: results_expansion56}
+          - {condition: C048, rep: 194, stratum: high, source: results_expansion56}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Retrieve original RDS (read-only)
+        env:
+          COND: ${{ matrix.condition }}
+          REP: ${{ matrix.rep }}
+          SOURCE: ${{ matrix.source }}
+        run: |
+          set -euo pipefail
+          git fetch origin results
+          mkdir -p original
+          printf -v RFILE "rep_%04d.rds" "$REP"
+          git show "origin/results:sim/$SOURCE/$COND/$RFILE" > original/result.rds
+          test -s original/result.rds
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+          use-public-rspm: false
+      - name: Install pinned original R environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gfortran libblas-dev liblapack-dev libuv1-dev
+          mkdir -p "$GITHUB_WORKSPACE/Rlib"
+          Rscript R_env/install_pinned.R "$GITHUB_WORKSPACE/Rlib"
+      - name: Independently regenerate frozen replication
+        working-directory: sim
+        env:
+          R_LIBS_USER: ${{ github.workspace }}/Rlib
+          IRTREE_COND: ${{ matrix.condition }}
+          IRTREE_REP_FROM: ${{ matrix.rep }}
+          IRTREE_REP_TO: ${{ matrix.rep }}
+          IRTREE_SEED_SCHEME: main
+          IRTREE_REQUIRE_FROZEN: '1'
+          IRTREE_ORACLE_DRAWS: '1'
+          IRTREE_OUT: ../new_results
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: Rscript main_sim.R
+      - name: Compare outputs, numerical linking, warnings and node missingness
+        env:
+          COND: ${{ matrix.condition }}
+          REP: ${{ matrix.rep }}
+          STRATUM: ${{ matrix.stratum }}
+        run: |
+          mkdir -p diagnostics
+          Rscript - <<'RS'
+          cond <- Sys.getenv("COND"); rep <- as.integer(Sys.getenv("REP")); stratum <- Sys.getenv("STRATUM")
+          old <- readRDS("original/result.rds")
+          new <- readRDS(sprintf("new_results/%s/rep_%04d.rds", cond, rep))
+          stopifnot(old$meta$condition_id==cond, old$meta$rep==rep,
+                    identical(old$meta$seed,new$meta$seed),
+                    identical(old$meta$manifest_id,new$meta$manifest_id),
+                    setequal(old$results$method,new$results$method),
+                    !any(old$results$status=="ERROR"),!any(new$results$status=="ERROR"),
+                    all(old$links$link_status=="OK"),all(new$links$link_status=="OK"))
+          metrics <- intersect(c("TP","FP","FN","FPR","power","FDP","any_FP","anchor_size",
+             "anchor_contaminated","anchor_precision","node_power","FP_node_tests",
+             "flags_on_dif_items_wrong_node"), intersect(names(old$results),names(new$results)))
+          a <- old$results[order(old$results$method),]
+          b <- new$results[order(new$results$method),]
+          stopifnot(identical(as.character(a$method),as.character(b$method)))
+          differences <- vapply(metrics,function(k) {
+            x<-as.numeric(a[[k]]); y<-as.numeric(b[[k]])
+            if(!identical(is.na(x),is.na(y))) return(Inf)
+            if(all(is.na(x))) return(0)
+            max(abs(x-y),na.rm=TRUE)
+          },numeric(1))
+          la <- old$links[order(old$links$method,old$links$node),]
+          lb <- new$links[order(new$links$method,new$links$node),]
+          stopifnot(identical(as.character(la$method),as.character(lb$method)),
+                    identical(as.character(la$node),as.character(lb$node)))
+          link_diff <- max(abs(la$est_mean-lb$est_mean),na.rm=TRUE)
+          warn_old <- old$meta$n_warnings_total; warn_new <- new$meta$n_warnings_total
+          warn_by_method_same <- identical(as.integer(a$n_warnings),as.integer(b$n_warnings))
+          expected <- if(stratum=="none") warn_old==0 else warn_old>0
+          tab <- data.frame(condition=cond,rep=rep,stratum=stratum,
+            warnings_original=warn_old,warnings_regenerated=warn_new,
+            warning_counts_same=warn_old==warn_new,
+            method_warnings_same=warn_by_method_same,
+            max_metric_abs_difference=max(differences),
+            max_link_mean_abs_difference=link_diff,
+            original_link_warnings=sum(old$links$link_n_warnings),
+            regenerated_link_warnings=sum(new$links$link_n_warnings),
+            expected_warning_stratum=expected)
+          write.csv(tab,"diagnostics/summary.csv",row.names=FALSE)
+          write.csv(data.frame(metric=names(differences),max_abs_diff=as.numeric(differences)),
+                    "diagnostics/metric_differences.csv",row.names=FALSE)
+          cat("### ",cond," rep ",rep," warning audit\n",sep="",file=Sys.getenv("GITHUB_STEP_SUMMARY"),append=TRUE)
+          capture.output(print(tab), file=Sys.getenv("GITHUB_STEP_SUMMARY"),append=TRUE)
+          if (!expected || max(differences)>1e-7 || link_diff>1e-5 ||
+              warn_old!=warn_new || !warn_by_method_same) stop("Sensitivity replication differs: inspect diagnostics")
+          RS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stratified-${{ matrix.condition }}-rep${{ matrix.rep }}-${{ matrix.stratum }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
