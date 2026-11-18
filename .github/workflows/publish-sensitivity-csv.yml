@@ -1,0 +1,67 @@
+name: Publish verified sensitivity and diagnostic CSV permanently
+on:
+  push:
+    paths:
+      - '.github/workflows/publish-sensitivity-csv.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publication:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+      - name: Download outputs from the two successful audit runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p publication/sensitivity140 publication/diagnostic_C032_rep92
+          gh run download 44089535717 --name corrected-allNA-140-aggregated-CSV --dir publication/sensitivity140
+          gh run download 44154392334 --name C032-92-RankK2-A-B-C-two-sessions --dir publication/diagnostic_C032_rep92
+      - name: Validate locked result shapes and provenance
+        run: |
+          python3 - <<'PY'
+          import csv,os,glob,math
+          p='publication/sensitivity140/'
+          def rows(path):
+              with open(path,newline='') as f:return list(csv.DictReader(f))
+          n=rows(p+'allNA_nodes_1680_corrected.csv')
+          m=rows(p+'allNA_comparison_560_corrected.csv')
+          s=rows(p+'allNA_selected_140_verified.csv')
+          assert len(n)==1680 and len(m)==560 and len(s)==140,(len(n),len(m),len(s))
+          assert all(math.isfinite(float(z['filtered_link_mean'])) for z in n)
+          assert all(math.isfinite(float(z['link_difference'])) for z in n)
+          a=rows('publication/diagnostic_C032_rep92/C032_rep92_RankK2_ABC_60.csv')
+          assert len(a)==60
+          assert len({(z['condition'],z['rep']) for z in s})==140
+          print("Validated 140 selections, 560 comparisons, 1680 node links, and 60 A/B/C p-value rows.")
+          print("sensitivity CSVs:",[os.path.basename(x) for x in glob.glob(p+'*.csv')])
+          print("diagnostic CSVs:",[os.path.basename(x) for x in glob.glob('publication/diagnostic_C032_rep92/*.csv')])
+          PY
+      - name: Record provenance and permanently commit only derived CSVs
+        run: |
+          set -euo pipefail
+          cat > publication/README.md <<'EOF'
+          # Published audit CSVs (derived results, read-only originals)
+          
+          - `sensitivity140/`: numerical sensitivity for all-NA pseudo-item rows; 140 fixed replications, 560 method-replication pairs, 1,680 method-node comparisons. Source: successful [GitHub Actions run 44089535717](https://github.com/mhssaiff12-spec/IRTree-DIF-Simulation/actions/runs/44089535717).
+          - `diagnostic_C032_rep92/`: isolated A/B/C diagnostic for C032, replicate 92, RankK2; 60 node tests and two independent fresh R sessions. Source: successful [GitHub Actions run 44154392334](https://github.com/mhssaiff12-spec/IRTree-DIF-Simulation/actions/runs/44154392334).
+          - Original 5,600 RDS replication files and condition summaries are preserved **unchanged** on the `results` branch under `sim/results_core8/`, `sim/results_expansion56/` and `sim/audit28/`.
+          - Frozen protocol identifier: `ab03dffdf580`.
+          - Reproduction scripts: `sim/sensitivity_allNA.R` and `sim/diagnose_C032_92_RankK2.R` on `main`. The fixed selection is `sim/sensitivity_selected_140.csv`.
+          
+          The aggregated sensitivity comparison of original saved RDS vs newly estimated filtered models does *not* isolate the deletion effect from numerical re-estimation; see the isolated C032 diagnostic and the manuscript's limitation.
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add publication/
+          git diff --cached --check
+          git commit -m "Publish complete validated sensitivity and A-B-C diagnostic CSVs for reproducibility"
+          git push origin HEAD:main
