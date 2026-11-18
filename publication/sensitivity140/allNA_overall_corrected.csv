@@ -1,0 +1,2 @@
+tested_replicates,method_replications,node_rows,max_abs_p_diff,max_abs_link_diff,node_decision_agreement,item_decision_agreement,changed_nodes,changed_items,failed_links,nonconverged_lr_tests,failed_lr_tests
+140,560,1680,0.00140312307289836,5.32300013400544e-07,1.0,1.0,0,0,0,0,0
