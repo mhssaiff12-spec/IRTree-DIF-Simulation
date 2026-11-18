@@ -15,7 +15,7 @@ Monte Carlo study of node-level differential item functioning (DIF) under respon
 | **All original 5,600 RDS replications** | [`sim/results_core8/` on `results`](../../tree/results/sim/results_core8), [`sim/results_expansion56/` on `results`](../../tree/results/sim/results_expansion56) | **Published on `results`; 28 conditions × 200 replications verified** |
 | Per-replication and condition summaries | [`sim/audit28/` on `results`](../../tree/results/sim/audit28) | Published on `results` |
 | Fixed 140 selected sensitivity replications | [`sim/sensitivity_selected_140.csv`](sim/sensitivity_selected_140.csv) | Published on `main` |
-| Corrected all-NA sensitivity outputs | [`publication/sensitivity140/`](publication/sensitivity140/) | Intended permanent derived CSVs; see publication status below |
+| Corrected all-NA sensitivity outputs | [`publication/sensitivity140/`](publication/sensitivity140/) | Published permanently on `main` |
 | C032 rep92 RankK2 A/B/C diagnostic | [`publication/diagnostic_C032_rep92/`](publication/diagnostic_C032_rep92/) | Intended permanent derived CSVs; see publication status below |
 
 ## Original data and analyses
@@ -31,7 +31,7 @@ The 140-replication sensitivity uses [`sim/sensitivity_allNA.R`](sim/sensitivity
 - [Corrected 140-replication workflow run](../../actions/runs/44089535717).
 - [C032 rep92 RankK2 A/B/C diagnostic workflow run](../../actions/runs/44154392334).
 
-**Note:** GitHub Actions artifacts have retention limits. The `publication/` directories are the intended permanent copies of the derived CSV outputs and should be checked for availability before citing them in a manuscript. The isolated A/B/C diagnostic differs from the aggregate saved-RDS-versus-filtered comparison and must not be described as a proof that every p-value was unchanged for all 140 replications.
+**Note:** GitHub Actions artifacts have retention limits. The `publication/` directories contain validated, permanently committed copies of derived CSV outputs; they are accessible independently of temporary Actions-artifact retention. The isolated A/B/C diagnostic differs from the aggregate saved-RDS-versus-filtered comparison and must not be described as a proof that every p-value was unchanged for all 140 replications.
 
 ## Reproduction
 
